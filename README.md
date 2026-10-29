@@ -361,6 +361,25 @@ DD = count2_soft(data, battrs=battrs, wattrs=wattrs, mattrs=mattrs,
                  soft_mu_sigma=0.05)['weight']  # Count2Poles
 ```
 
+`count2_soft` is JAX-traceable: it composes with `jax.jit`, `jax.grad` and
+`jax.value_and_grad`, and the gradient runs through the analytic CUDA adjoint (one extra
+kernel, not finite differences). The lsstypes containers are not pytrees, so a jit-ed
+function must return arrays --- take `values('counts')`, stacking the poles for
+`Count2Poles`:
+
+```python
+@jax.jit
+def counts(p, w):
+    DD = count2_soft(Particles(p, w), battrs=battrs, mattrs=mattrs)['weight']
+    return jnp.stack([pole.values('counts') for pole in DD], axis=-1)
+
+jax.grad(lambda w: jnp.sum(counts(positions, w)))(weights)  # -> positions/weights
+```
+
+The mesh has to be passed explicitly (`mattrs=...`), exactly as for the hard `count2`: it
+cannot infer the box from traced positions. The hard `count2` has no adjoint, so it is not
+differentiable --- gradients need the soft kernel.
+
 `soft_sigma` defaults to half a bin: on a non-uniform grid it is half of *each* bin, so
 `attrs['soft_sigma']` is the multiplier of the local width (`soft_sigma_kind='width'`),
 while on an arithmetic grid it is an absolute width (`'absolute'`). Pass a number for a

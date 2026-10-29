@@ -24,6 +24,7 @@ import os
 import numpy as np
 
 from cucount.numpy import BinAttrs, MeshAttrs, Particles
+from cucount.numpy import soft as nsoft
 from cucount.types import count2, count2_soft
 from lsstypes import Count2Poles
 
@@ -122,6 +123,54 @@ def main():
         rel = np.abs(soft_v[mask, i] / hard_v[mask, i] - 1)
         print(f'  ell = {ell}: median |soft/hard - 1| = {np.median(rel):.2e}, '
               f'max = {rel.max():.2e}')
+
+    # --- jit and gradients ------------------------------------------------
+    # The wrapper is JAX-traceable: nothing converts the counts with numpy, so
+    # jit/grad compose with it, and the gradient goes through the analytic CUDA
+    # adjoint (one extra kernel, no finite differences). The lsstypes containers
+    # are not pytrees, so a jit-ed function returns the counts array.
+    import time
+
+    import jax
+    jax.config.update('jax_enable_x64', True)
+    import jax.numpy as jnp
+    from cucount.jax import BinAttrs as JBinAttrs, MeshAttrs as JMeshAttrs, Particles as JParticles
+
+    pos = np.asarray(p.positions)
+    wts = np.asarray(p.get('weights')[0])
+    jbattrs = JBinAttrs(s=EDGES)
+    jmattrs = JMeshAttrs(pos, battrs=jbattrs, periodic=True, boxsize=BOX)
+
+    @jax.jit
+    def jit_counts(pp, ww):
+        return count2_soft(JParticles(pp, ww), battrs=jbattrs, mattrs=jmattrs)['weight'].values('counts')
+
+    def timed(fn):
+        fn().block_until_ready()
+        start = time.perf_counter()
+        for _ in range(3):
+            out = fn()
+        out.block_until_ready()
+        return out, (time.perf_counter() - start) / 3
+
+    first = jit_counts(pos, wts)
+    start = time.perf_counter()
+    first = jit_counts(pos, wts)
+    first.block_until_ready()
+    cold = time.perf_counter() - start
+    _, warm = timed(lambda: jit_counts(pos, wts))
+    counts_np = np.asarray(first)
+    print(f'\njit: cold {1e3 * cold:.1f} ms, warm {1e3 * warm:.1f} ms')
+    print(f'  jit vs eager counts: max |diff| = '
+          f'{np.max(np.abs(counts_np - soft_c)):.2e}')
+
+    # d/dw sum(counts^2)/2 hands the adjoint the cotangent ``counts``
+    loss = jax.jit(jax.grad(lambda ww: jnp.sum(jit_counts(pos, ww) ** 2) / 2))
+    g_weight = np.asarray(loss(wts))
+    ref = nsoft.count2_soft_vjp(p, p, battrs=battrs_s, mattrs=mattrs, cotangent=counts_np)
+    ref_weight = ref['grad_weight1'] + ref['grad_weight2']
+    print(f'  gradient through the wrapper vs the CUDA adjoint: '
+          f'{np.max(np.abs(g_weight - ref_weight)) / np.max(np.abs(ref_weight)):.2e}')
 
     # --- figure -----------------------------------------------------------
     centres = 0.5 * (EDGES[1:] + EDGES[:-1])
