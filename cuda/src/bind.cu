@@ -739,6 +739,9 @@ static py::dict soft_meta(const SoftBinSpec &spec)
     soft["sigma_kind"] = spec.per_bin_sigma ? "width" : "absolute";
     soft["uniform"] = spec.uniform != 0;
     soft["fast_taps"] = spec.fast_taps != 0;
+    // Accumulator of the shared-memory tiles: float32 by default, which is
+    // ~1.5-3x faster than double because shared atomicAdd(double) is a CAS loop.
+    soft["accum"] = spec.acc_float ? "float32" : "float64";
     soft["cutoff"] = spec.cutoff;
     soft["kmax"] = spec.kmax;
     // Only the uniform path has a fixed window length; the general path expands
@@ -811,6 +814,7 @@ py::object count2_soft_py(
     py::object soft_sigma_obj = py::none(),
     const double soft_cutoff = 1e-13,
     const std::string &soft_taps = "exact",
+    const std::string &soft_accum = "float32",
     py::object soft_mu_sigma_obj = py::none(),
     const int soft_mu_bins = 0,
     py::object soft_mu_edges_obj = py::none(),
@@ -858,6 +862,16 @@ py::object count2_soft_py(
     else if (soft_taps != "exact") {
         throw std::invalid_argument(
             "cuda backend, soft binning: soft_taps must be 'exact' or 'fast'");
+    }
+
+    // f32 tile accumulation is the default (see SoftBinSpec::acc_float); 'float64'
+    // restores the bit-comparable path for callers who need the extra digits.
+    if (soft_accum == "float64") {
+        spec.acc_float = 0;
+    }
+    else if (soft_accum != "float32") {
+        throw std::invalid_argument(
+            "cuda backend, soft binning: soft_accum must be 'float32' or 'float64'");
     }
 
     int ngpus = 1;
@@ -988,6 +1002,7 @@ py::object count2_soft_vjp_py(
     py::object soft_sigma_obj = py::none(),
     const double soft_cutoff = 1e-13,
     const std::string &soft_taps = "exact",
+    const std::string &soft_accum = "float32",
     py::object soft_mu_sigma_obj = py::none(),
     const int soft_mu_bins = 0,
     py::object soft_mu_edges_obj = py::none(),
@@ -1033,6 +1048,16 @@ py::object count2_soft_vjp_py(
     else if (soft_taps != "exact") {
         throw std::invalid_argument(
             "cuda backend, soft binning: soft_taps must be 'exact' or 'fast'");
+    }
+
+    // f32 tile accumulation is the default (see SoftBinSpec::acc_float); 'float64'
+    // restores the bit-comparable path for callers who need the extra digits.
+    if (soft_accum == "float64") {
+        spec.acc_float = 0;
+    }
+    else if (soft_accum != "float32") {
+        throw std::invalid_argument(
+            "cuda backend, soft binning: soft_accum must be 'float32' or 'float64'");
     }
 
     const auto *pairs = cotangent.data();
@@ -1183,6 +1208,7 @@ PYBIND11_MODULE(cuda, m) {
         py::arg("soft_sigma") = py::none(),
         py::arg("soft_cutoff") = 1e-13,
         py::arg("soft_taps") = "exact",
+        py::arg("soft_accum") = "float32",
         py::arg("soft_mu_sigma") = py::none(),
         py::arg("soft_mu_bins") = 0,
         py::arg("soft_mu_edges") = py::none(),
@@ -1207,6 +1233,7 @@ PYBIND11_MODULE(cuda, m) {
         py::arg("soft_sigma") = py::none(),
         py::arg("soft_cutoff") = 1e-13,
         py::arg("soft_taps") = "exact",
+        py::arg("soft_accum") = "float32",
         py::arg("soft_mu_sigma") = py::none(),
         py::arg("soft_mu_bins") = 0,
         py::arg("soft_mu_edges") = py::none(),

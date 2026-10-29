@@ -21,6 +21,14 @@ from cucount.numpy import count2, count2_soft, default_sigma, soft_weights
 
 from cucount.numpy.soft import _bin_centres, is_uniform, sigmas
 
+# The reference tests below check the softmax math, the window and the adjoint
+# against exact references, so they pin the exact accumulator. The default
+# float32 shared-memory tile costs a few 1e-7 relative on the counts (see
+# test_soft_s_cuda.py::test_float32_accumulation_is_the_default); at 1e-12
+# tolerances that rounding, not the model, is what a failure would measure.
+ACC = 'float64'
+
+
 needs_cuda = pytest.mark.skipif(
     cudalib is None or cudalib.device_count() == 0,
     reason='CUDA extension not built, or no GPU visible')
@@ -60,7 +68,7 @@ def test_conserves_total_weight():
     """Soft binning smooths a histogram, it does not reweight pairs."""
     p, ba, ma = _setup()
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cuda')['weight']
-    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda')
+    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC)
     assert soft['weight'].shape == hard.shape
     np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=1e-12)
 
@@ -70,7 +78,7 @@ def test_matches_brute_force():
     p, ba, ma = _setup()
     sigma = 2.0
     got = count2_soft(p, p, battrs=ba, mattrs=ma,
-                      soft_sigma=sigma, backend='cuda')['weight']
+                      soft_sigma=sigma, backend='cuda', soft_accum=ACC)['weight']
     want = _brute_soft(p, EDGES, sigma, box=BOX)
     np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-8 * want.max())
 
@@ -80,7 +88,7 @@ def test_non_periodic_matches_brute_force():
     p, ba, ma = _setup(n=300, seed=11, periodic=False)
     sigma = 3.0
     got = count2_soft(p, p, battrs=ba, mattrs=ma,
-                      soft_sigma=sigma, backend='cuda')['weight']
+                      soft_sigma=sigma, backend='cuda', soft_accum=ACC)['weight']
     want = _brute_soft(p, EDGES, sigma, box=None)
     np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-8 * want.max())
 
@@ -91,7 +99,7 @@ def test_sigma_to_zero_is_hard_binning():
     p, ba, ma = _setup()
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cuda')['weight']
     soft = count2_soft(p, p, battrs=ba, mattrs=ma,
-                       soft_sigma=1e-6, backend='cuda')['weight']
+                       soft_sigma=1e-6, backend='cuda', soft_accum=ACC)['weight']
     np.testing.assert_allclose(soft, hard, rtol=1e-10, atol=1e-10 * hard.max())
 
 
@@ -101,11 +109,11 @@ def test_cutoff_truncation_is_monotone():
     p, ba, ma = _setup()
     sigma = 2.0
     ref = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=sigma,
-                      soft_cutoff=1e-13, backend='cuda')['weight']
+                      soft_cutoff=1e-13, backend='cuda', soft_accum=ACC)['weight']
     errs = []
     for cutoff in (1e-6, 1e-3):
         got = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=sigma,
-                          soft_cutoff=cutoff, backend='cuda')
+                          soft_cutoff=cutoff, backend='cuda', soft_accum=ACC)
         np.testing.assert_allclose(got['weight'].sum(), ref.sum(), rtol=1e-12)
         errs.append(np.abs(got['weight'] - ref).max())
     assert errs[0] < errs[1] < 1e-2 * ref.max()
@@ -114,7 +122,7 @@ def test_cutoff_truncation_is_monotone():
 @needs_cuda
 def test_meta_reports_the_configuration_it_ran():
     p, ba, ma = _setup()
-    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda')
+    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC)
     meta = soft['soft']
     assert meta['sigma'] == pytest.approx(default_sigma(EDGES))
     # taps must cover the cutoff window, and be odd (centre + both sides)
@@ -127,7 +135,7 @@ def test_meta_reports_the_configuration_it_ran():
 def test_bin_grid_of_arange_is_served():
     """BIN_CUSTOM with uniform edges must work: uniformity is what is required."""
     p, ba, ma = _setup(edges=np.arange(1.0, 101.0, 5.0))
-    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda')
+    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC)
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cuda')['weight']
     np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=1e-12)
 
@@ -139,7 +147,7 @@ LOG_EDGES = np.geomspace(1.0, 100.0, 21)
 def test_log_grid_width_scaled_sigma_matches_brute_force():
     """Non-uniform grid, default sigma: half of each bin, not half a mean bin."""
     p, ba, ma = _setup(edges=LOG_EDGES)
-    res = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda')
+    res = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC)
     want = _brute_soft(p, LOG_EDGES, None, box=BOX)
     np.testing.assert_allclose(res['weight'], want, rtol=1e-9, atol=1e-9 * want.max())
     meta = res['soft']
@@ -154,7 +162,7 @@ def test_log_grid_absolute_sigma_matches_brute_force():
     """An explicit sigma is one absolute width on every bin, uniform grid or not."""
     p, ba, ma = _setup(edges=LOG_EDGES)
     sigma = 4.0
-    res = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=sigma, backend='cuda')
+    res = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=sigma, backend='cuda', soft_accum=ACC)
     want = _brute_soft(p, LOG_EDGES, sigma, box=BOX)
     np.testing.assert_allclose(res['weight'], want, rtol=1e-9, atol=1e-9 * want.max())
     assert res['soft']['sigma_kind'] == 'absolute'
@@ -165,9 +173,9 @@ def test_log_grid_absolute_sigma_matches_brute_force():
 def test_non_uniform_fast_taps_tracks_exact():
     """The opt-in __expf path trades ~1e-6 relative accuracy, nothing more."""
     p, ba, ma = _setup(edges=LOG_EDGES)
-    exact = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda')['weight']
+    exact = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC)['weight']
     fast = count2_soft(p, p, battrs=ba, mattrs=ma,
-                       soft_taps='fast', backend='cuda')['weight']
+                       soft_taps='fast', backend='cuda', soft_accum=ACC)['weight']
     scale = exact.max()
     np.testing.assert_allclose(fast, exact, rtol=1e-5, atol=1e-5 * scale)
     assert not np.array_equal(fast, exact)  # it really took the other branch
@@ -184,7 +192,7 @@ def test_log_grid_conserves_total_weight():
     p, ba, ma = _setup(edges=LOG_EDGES)
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cuda')['weight']
     for kw in ({}, {'soft_sigma': 2.0}, {'soft_taps': 'fast'}):
-        soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', **kw)
+        soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', **kw, soft_accum=ACC)
         np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=1e-12)
 
 
@@ -203,7 +211,7 @@ def test_log_grid_tiny_absolute_sigma_snaps_to_the_nearest_centre():
     """
     p, ba, ma = _setup(edges=LOG_EDGES)
     for sigma in (1e-4, 1e-6):
-        soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_sigma=sigma)
+        soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_sigma=sigma, soft_accum=ACC)
         np.testing.assert_allclose(soft['weight'],
                                    _brute_soft(p, LOG_EDGES, sigma, box=BOX),
                                    rtol=1e-11, atol=1e-9 * soft['weight'].max())
@@ -213,7 +221,7 @@ def test_log_grid_tiny_absolute_sigma_snaps_to_the_nearest_centre():
 def test_uniform_grid_reports_recurrence_path():
     """A uniform grid keeps the two-exp recurrence, with the fixed window it implies."""
     p, ba, ma = _setup()
-    res = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=2.0, backend='cuda')
+    res = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=2.0, backend='cuda', soft_accum=ACC)
     meta = res['soft']
     assert meta['uniform'] is True
     assert meta['sigma_kind'] == 'absolute'
@@ -224,7 +232,7 @@ def test_uniform_grid_reports_recurrence_path():
 def test_rejects_bad_taps_mode():
     p, ba, ma = _setup()
     with pytest.raises(ValueError, match='soft_taps'):
-        count2_soft(p, p, battrs=ba, mattrs=ma, soft_taps='turbo', backend='cuda')
+        count2_soft(p, p, battrs=ba, mattrs=ma, soft_taps='turbo', backend='cuda', soft_accum=ACC)
 
 
 @needs_cuda
@@ -238,7 +246,7 @@ def test_rejects_an_unsupported_second_axis():
     ba2 = BinAttrs(s=EDGES, mu=(np.linspace(-1, 1, 9), 'z'))
     ma2 = MeshAttrs(p, p, boxsize=BOX, battrs=ba2, periodic=True)
     with pytest.raises(ValueError, match='not served'):
-        count2_soft(p, p, battrs=ba2, mattrs=ma2, backend='cuda')
+        count2_soft(p, p, battrs=ba2, mattrs=ma2, backend='cuda', soft_accum=ACC)
 
 
 @needs_cuda
@@ -247,14 +255,14 @@ def test_rejects_bad_cutoff():
     for cutoff in (0.0, 1.0, 2.0, -1e-3):
         with pytest.raises(ValueError, match='soft_cutoff'):
             count2_soft(p, p, battrs=ba, mattrs=ma, soft_cutoff=cutoff,
-                        backend='cuda')
+                        backend='cuda', soft_accum=ACC)
 
 
 @needs_cuda
 def test_rejects_non_cuda_backend():
     p, ba, ma = _setup()
     with pytest.raises(NotImplementedError, match='CUDA-only'):
-        count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu')
+        count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu', soft_accum=ACC)
 
 
 def test_soft_weights_is_a_normalised_softmax():
@@ -302,3 +310,30 @@ def test_sigmas_rejects_non_positive_sigma():
 
 def test_default_sigma_is_half_the_mean_bin_width():
     assert default_sigma(EDGES) == pytest.approx(0.5 * DS)
+
+
+@needs_cuda
+def test_float32_accumulation_is_the_default():
+    """The default tile is float32; it must stay within a few 1e-7 of exact.
+
+    The kernel computes the logits in double either way, so the only difference
+    between the two paths is the shared-memory histogram and the per-block partial
+    sums written into the float64 result.
+    """
+    p, ba, ma = _setup(n=2000)
+    default = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda')
+    exact = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum='float64')
+
+    assert default['soft']['accum'] == 'float32'
+    assert exact['soft']['accum'] == 'float64'
+    np.testing.assert_allclose(default['weight'], exact['weight'], rtol=1e-5, atol=0)
+    # Guard against the knob being ignored: with ~4e6 pairs spread over 20 bins the
+    # two accumulators cannot agree bit for bit.
+    assert np.max(np.abs(default['weight'] - exact['weight'])) > 0
+
+
+@needs_cuda
+def test_soft_accum_rejects_an_unknown_value():
+    p, ba, ma = _setup(n=50)
+    with pytest.raises(ValueError, match='soft_accum'):
+        count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum='float16')

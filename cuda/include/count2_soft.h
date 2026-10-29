@@ -103,6 +103,14 @@ struct SoftBinSpec {
     int uniform;         // 1 when edges[i] == edges[0] + i * ds: recurrence path
     int per_bin_sigma;   // 1 when sigma_i = alpha * (edges[i+1] - edges[i])
     int fast_taps;       // 1: the general path may trade accuracy for __expf
+    // Scatter accumulator width. 1 (default): the shared tile is float32 and its
+    // reduction is added into the float64 histogram once per block, which costs
+    // ~1e-7 * sqrt(counts per bin) of relative noise and 1.5-3x of the tap loop
+    // (a shared atomicAdd(double*) is a CAS loop on Ampere). 0: the tile is
+    // float64, bit-comparable with the original kernel. Positions, separations
+    // and the tap weights are always computed in float64: only the accumulator
+    // is narrowed, so pair selection is identical either way.
+    int acc_float;
     FLOAT sigma;         // the absolute sigma when per_bin_sigma == 0
     FLOAT alpha;         // sigma_i / local width when per_bin_sigma == 1
     FLOAT thresh;        // ln(1 / cutoff): the logit distance that truncates
@@ -176,7 +184,7 @@ inline SoftBinSpec make_soft_bin_spec(const BinAttrs &battrs, const WeightAttrs 
                                       double cutoff, size_t *csize,
                                       double mu_sigma = 0., int mu_bins = 0,
                                       const FLOAT *mu_edges = nullptr,
-                                      int mu_nedges = 0)
+                                      int mu_nedges = 0, int acc_float = 1)
 {
     const char *prefix = "cuda backend, soft binning: ";
 
@@ -274,6 +282,7 @@ inline SoftBinSpec make_soft_bin_spec(const BinAttrs &battrs, const WeightAttrs 
     spec.inv2s2 = nullptr;
     spec.edges = nullptr;
     spec.fast_taps = 0;
+    spec.acc_float = acc_float ? 1 : 0;
 
     // sigma <= 0 or None means "half a bin", the pyfcfc default: at that width a
     // pair keeps ~68% of its weight on its own bin and the rest on the two
@@ -583,5 +592,19 @@ void count2_soft_vjp(const FLOAT *cotangent, FLOAT *grad_position1,
                      const Mesh *list_mesh, const Count2Attrs &attrs,
                      const SoftBinSpec &spec, DeviceMemoryBuffer *buffer,
                      cudaStream_t stream);
+
+// Narrow-storage boundary support.
+//
+// The kernel computes in FLOAT (float64) regardless of how the caller stores its
+// positions and weights, so the jax FFI entry points can accept float32 arrays
+// without giving up the double-precision geometry: separations, logits and the
+// per-pair maths stay wide, only the *sample* is narrow. These two helpers copy
+// between the caller's float32 buffers and a float64 staging area. Widening a
+// float32 sample is exact; narrowing the result rounds once, at the boundary.
+void soft_cast_f32_to_f64(FLOAT *dst, const float *src, size_t n,
+                          cudaStream_t stream);
+void soft_cast_f64_to_f32(float *dst, const FLOAT *src, size_t n,
+                          cudaStream_t stream);
+
 
 #endif  // _CUCOUNT_COUNT2_SOFT_

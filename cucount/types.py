@@ -221,6 +221,7 @@ def _soft_self_pair_mask(battrs: BinAttrs, soft_sigma=None, soft_cutoff=1e-13,
 
 def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttrs=None, norm=None,
                 soft_sigma: float=None, soft_cutoff: float=1e-13, soft_taps: str='exact',
+                soft_accum: str='float32',
                 soft_mu_sigma: float=None, soft_mu_bins: int=0, soft_mu_edges=None, **kwargs):
     """
     Perform soft pair counts, exporting to :mod:`lsstypes` format.
@@ -262,6 +263,10 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
     soft_taps : {'exact', 'fast'}
         Only affects a non-uniform ``s`` grid: ``'exact'`` (default) uses double
         ``exp``, ``'fast'`` uses ``__expf`` for ~1e-6 weight accuracy.
+    soft_accum : {'float32', 'float64'}
+        Precision of the per-block shared-memory histograms. ``'float32'``
+        (default) is 1.5-3x faster on Ampere and later, at a few 1e-7 relative on
+        the counts; ``'float64'`` restores the bit-comparable path.
     soft_mu_sigma : float, optional
         Width of the mu kernel when ``battrs`` has a pole axis; ``None`` means
         half a mu cell.
@@ -305,7 +310,8 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
     raw_counts = count2_soft(*(particles * 2 if autocorr else particles),
                              battrs=battrs, wattrs=wattrs,
                              soft_sigma=soft_sigma, soft_cutoff=soft_cutoff,
-                             soft_taps=soft_taps, soft_mu_sigma=soft_mu_sigma,
+                             soft_taps=soft_taps, soft_accum=soft_accum,
+                             soft_mu_sigma=soft_mu_sigma,
                              soft_mu_bins=soft_mu_bins, soft_mu_edges=soft_mu_edges,
                              **kwargs)
     meta = dict(raw_counts.get('soft') or {})
@@ -317,7 +323,7 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
     attrs = dict(wsum=sum_weights1)
     # Keep the soft configuration with the counts: without it a saved
     # correlation cannot be told apart from a hard-binned one.
-    for key in ('sigma', 'sigma_kind', 'cutoff', 'kmax', 'multipoles',
+    for key in ('sigma', 'sigma_kind', 'accum', 'cutoff', 'kmax', 'multipoles',
                 'mu_sigma', 'mu_bins', 'mu_kmax', 'mu_uniform', 'mu_sigma_kind', 'los'):
         if key in meta:
             attrs[f'soft_{key}'] = meta[key]

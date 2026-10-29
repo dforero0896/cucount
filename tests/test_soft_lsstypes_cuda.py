@@ -20,6 +20,14 @@ from cucount.numpy import (BinAttrs, MeshAttrs, Particles, SplitAttrs,
 from cucount.types import count2, count2_soft
 from lsstypes import Count2Poles
 
+# The reference tests below check the softmax math, the window and the adjoint
+# against exact references, so they pin the exact accumulator. The default
+# float32 shared-memory tile costs a few 1e-7 relative on the counts (see
+# test_soft_s_cuda.py::test_float32_accumulation_is_the_default); at 1e-12
+# tolerances that rounding, not the model, is what a failure would measure.
+ACC = 'float64'
+
+
 needs_cuda = pytest.mark.skipif(
     cudalib is None or cudalib.device_count() == 0,
     reason='CUDA extension not built, or no GPU visible')
@@ -81,10 +89,10 @@ def test_isotropic_counts_match_the_raw_frontend(s_min):
     edges = np.linspace(s_min, 50., 16)
     p = _catalogue()
     battrs = BinAttrs(s=edges)
-    DD = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs))['weight']
+    DD = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight']
 
     raw = np.asarray(nsoft.count2_soft(p, p, battrs=battrs,
-                                      mattrs=_mattrs(p, p, battrs))['weight'])
+                                      mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight'])
     sumw2 = (_w(p)**2).sum()
     want = raw - sumw2 * _self_profile(edges)
 
@@ -109,10 +117,10 @@ def test_poles_match_the_raw_frontend():
     p = _catalogue()
     battrs = BinAttrs(s=edges, pole=(ELLS, 'z'))
     DD = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs),
-                     soft_mu_sigma=0.05)['weight']
+                     soft_mu_sigma=0.05, soft_accum=ACC)['weight']
 
     raw = np.asarray(nsoft.count2_soft(p, p, battrs=battrs, soft_mu_sigma=0.05,
-                                      mattrs=_mattrs(p, p, battrs))['weight'])
+                                      mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight'])
     sumw2 = (_w(p)**2).sum()
     want = raw - sumw2 * _self_profile(edges, ELLS, soft_mu_sigma=0.05)
 
@@ -122,7 +130,7 @@ def test_poles_match_the_raw_frontend():
     assert list(np.atleast_1d(DD.get(0).attrs['soft_multipoles'])) == ELLS
 
     # l = 0 is the isotropic soft count, as in the kernel.
-    iso = count2_soft(p, battrs=BinAttrs(s=edges), mattrs=_mattrs(p, p, battrs))['weight']
+    iso = count2_soft(p, battrs=BinAttrs(s=edges), mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight']
     np.testing.assert_allclose(_counts(DD)[:, 0], _counts(iso), rtol=1e-13, atol=1e-15)
 
 
@@ -132,10 +140,10 @@ def test_cross_correlation_removes_no_self_pairs():
     edges = np.linspace(0., 50., 16)
     p1, p2 = _catalogue(seed=3), _catalogue(seed=4)
     battrs = BinAttrs(s=edges)
-    DD = count2_soft(p1, p2, battrs=battrs, mattrs=_mattrs(p1, p2, battrs))['weight']
+    DD = count2_soft(p1, p2, battrs=battrs, mattrs=_mattrs(p1, p2, battrs), soft_accum=ACC)['weight']
 
     raw = np.asarray(nsoft.count2_soft(p1, p2, battrs=battrs,
-                                      mattrs=_mattrs(p1, p2, battrs))['weight'])
+                                      mattrs=_mattrs(p1, p2, battrs), soft_accum=ACC)['weight'])
     np.testing.assert_allclose(_counts(DD), raw, rtol=1e-15, atol=0.)
     np.testing.assert_allclose(np.ravel(DD.norm)[0],
                                _w(p1).sum() * _w(p2).sum(), rtol=1e-13)
@@ -149,7 +157,7 @@ def test_matches_a_pair_by_pair_reference():
     pos, w = np.asarray(p.positions), _w(p)
     battrs = BinAttrs(s=edges, pole=(ELLS, 'z'))
     DD = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs),
-                     soft_mu_sigma=0.1)['weight']
+                     soft_mu_sigma=0.1, soft_accum=ACC)['weight']
 
     want = np.zeros((edges.size - 1, len(ELLS)))
     for i in range(pos.shape[0]):
@@ -176,7 +184,7 @@ def test_attrs_survive_an_hdf5_round_trip(tmp_path):
     edges = np.linspace(0., 50., 16)
     p = _catalogue()
     battrs = BinAttrs(s=edges, pole=(ELLS, 'z'))
-    DD = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs))['weight']
+    DD = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight']
 
     path = tmp_path / 'soft.h5'
     DD.write(path)
@@ -199,11 +207,11 @@ def test_split_requests_are_rejected():
     mattrs = _mattrs(p_split, p_split, battrs)
 
     with pytest.raises(NotImplementedError, match='split'):
-        count2_soft(p_split, battrs=battrs, spattrs=spattrs, mattrs=mattrs)
+        count2_soft(p_split, battrs=battrs, spattrs=spattrs, mattrs=mattrs, soft_accum=ACC)
     # The raw frontend rejects it too, rather than silently dropping the splits.
     with pytest.raises(NotImplementedError, match='split'):
         nsoft.count2_soft(p_split, p_split, battrs=battrs, spattrs=spattrs,
-                          mattrs=mattrs)
+                          mattrs=mattrs, soft_accum=ACC)
 
 
 @needs_cuda
@@ -221,8 +229,8 @@ def test_jax_particles_dispatch_to_the_jax_frontend():
     p = _catalogue()
     battrs = BinAttrs(s=edges, pole=(ELLS, 'z'))
     jp = JParticles(jnp.asarray(np.asarray(p.positions)), jnp.asarray(_w(p)))
-    dj = count2_soft(jp, battrs=battrs, mattrs=_mattrs(p, p, battrs))['weight']
-    dn = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs))['weight']
+    dj = count2_soft(jp, battrs=battrs, mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight']
+    dn = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight']
     got, want = _counts(dj), _counts(dn)
     np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-13 * np.abs(want).max())
 
@@ -235,7 +243,7 @@ def test_hard_and_soft_wrappers_agree_in_the_narrow_sigma_limit():
     battrs = BinAttrs(s=edges)
     hard = count2(p, battrs=battrs, mattrs=_mattrs(p, p, battrs))['weight']
     soft = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs),
-                       soft_sigma=1e-3)['weight']
+                       soft_sigma=1e-3, soft_accum=ACC)['weight']
     got, want = _counts(soft), _counts(hard)
     np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-10 * np.abs(want).max())
 
@@ -294,7 +302,7 @@ def test_wrapper_is_jax_traceable():
 
         def soft(pp, ww, jbattrs=jbattrs, mattrs=mattrs, kw=kw):
             return _flat_counts(count2_soft(JParticles(pp, ww), battrs=jbattrs, mattrs=mattrs,
-                                            **kw)['weight'])
+                                            **kw, soft_accum=ACC)['weight'])
 
         eager = np.asarray(soft(pos, w))
         jitted = np.asarray(jax.jit(soft)(pos, w))
@@ -302,7 +310,7 @@ def test_wrapper_is_jax_traceable():
         # and against the numpy frontend, whose self pairs are removed identically
         p_np = Particles(np.asarray(pos), np.asarray(w))
         ref = np.asarray(_counts(count2_soft(p_np, battrs=nbattrs,
-                                             mattrs=_mattrs(p_np, p_np, nbattrs), **kw)['weight']))
+                                             mattrs=_mattrs(p_np, p_np, nbattrs), **kw, soft_accum=ACC)['weight']))
         np.testing.assert_allclose(jitted, ref, rtol=1e-11)
 
 
@@ -326,7 +334,7 @@ def test_gradients_flow_through_the_wrapper():
 
         def soft(pp, ww, jbattrs=jbattrs, mattrs=mattrs, kw=kw):
             return _flat_counts(count2_soft(JParticles(pp, ww), battrs=jbattrs, mattrs=mattrs,
-                                            **kw)['weight'])
+                                            **kw, soft_accum=ACC)['weight'])
 
         loss = lambda pp, ww: jax.numpy.sum(jax.numpy.cos(soft(pp, ww)))
         g_pos, g_weight = (np.asarray(g) for g in jax.jit(jax.grad(loss, argnums=(0, 1)))(pos, w))
@@ -334,7 +342,7 @@ def test_gradients_flow_through_the_wrapper():
         p_np = Particles(np.asarray(pos), np.asarray(w))
         ref = nsoft.count2_soft_vjp(p_np, p_np, battrs=nbattrs,
                                     mattrs=_mattrs(p_np, p_np, nbattrs),
-                                    cotangent=-np.sin(np.asarray(soft(pos, w))), **kw)
+                                    cotangent=-np.sin(np.asarray(soft(pos, w))), **kw, soft_accum=ACC)
         for got, want in ((g_pos, ref['grad_position1'] + ref['grad_position2']),
                           (g_weight, ref['grad_weight1'] + ref['grad_weight2'])):
             scale = max(float(np.max(np.abs(want))), 1e-30)

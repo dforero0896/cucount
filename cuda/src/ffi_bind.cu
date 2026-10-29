@@ -161,6 +161,7 @@ void set_count2_soft_attrs_py(
     double soft_sigma = 0.,
     double soft_cutoff = 1e-13,
     const std::string &soft_taps = "exact",
+    const std::string &soft_accum = "float32",
     double soft_mu_sigma = 0.,
     int soft_mu_bins = 0,
     py::object soft_mu_edges = py::none())
@@ -201,6 +202,16 @@ void set_count2_soft_attrs_py(
     else if (soft_taps != "exact") {
         throw std::invalid_argument(
             "cuda backend, soft binning: soft_taps must be 'exact' or 'fast'");
+    }
+
+    // f32 tile accumulation is the default (see SoftBinSpec::acc_float); 'float64'
+    // restores the bit-comparable path for callers who need the extra digits.
+    if (soft_accum == "float64") {
+        soft_spec2.acc_float = 0;
+    }
+    else if (soft_accum != "float32") {
+        throw std::invalid_argument(
+            "cuda backend, soft binning: soft_accum must be 'float32' or 'float64'");
     }
 }
 
@@ -373,9 +384,15 @@ py::tuple get_count3_layout_py()
 // FFI helpers
 // -----------------------------------------------------------------------------
 
-void set_mem_buffer(DeviceMemoryBuffer *membuffer, ffi::ResultBuffer<ffi::F64> buffer) {
+// The scratch buffer is just bytes: it is declared with the same element type as
+// the call's float type so that a float32 call does not need a float64 (and
+// therefore JAX_ENABLE_X64) array to carry its scratch.
+template <ffi::DataType DT>
+void set_mem_buffer(DeviceMemoryBuffer *membuffer, ffi::ResultBuffer<DT> buffer) {
+    constexpr size_t width = (DT == ffi::F32) ? 4 : 8;
+
     membuffer->ptr = (void *) buffer->typed_data();
-    membuffer->size = buffer->dimensions().front() * 8 / sizeof(char);
+    membuffer->size = buffer->dimensions().front() * width / sizeof(char);
     membuffer->offset = 0;
 }
 
@@ -452,14 +469,94 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // soft count2 FFI impl
 // -----------------------------------------------------------------------------
 
+// The two entry points below are float64 *and* float32, selected by the caller's
+// dtype: with JAX_ENABLE_X64 unset no float64 array can even be constructed on
+// the jax side, so "cast in the frontend" is not an option there. The kernel is
+// float64 internally either way; a float32 call widens its samples into
+// `soft_scratch` and narrows the results back once, at the boundary.
+
+template <ffi::DataType DT>
+static size_t ffi_elements(const ffi::Buffer<DT> &buffer)
+{
+    size_t n = 1;
+
+    for (int64_t dim : buffer.dimensions()) {
+        n *= (size_t) dim;
+    }
+
+    return n;
+}
+
+// XLA owns only the declared result buffers, so a float32 call has nowhere to
+// put its float64 working set: stage it here and grow on demand. Note the two
+// consequences: the memory is per process (a larger call reallocates, and
+// cudaFree/cudaMalloc synchronise), and two calls in flight on different streams
+// would share it -- the attrs staging (`soft_spec2`) already assumes one soft
+// call at a time per process.
+struct SoftScratch {
+    std::vector<void *> ptrs;
+    std::vector<size_t> bytes;
+
+    FLOAT *f64(size_t slot, size_t n)
+    {
+        if (slot >= ptrs.size()) {
+            ptrs.resize(slot + 1, nullptr);
+            bytes.resize(slot + 1, 0);
+        }
+
+        const size_t want = n * sizeof(FLOAT);
+
+        if (bytes[slot] < want) {
+            if (ptrs[slot]) {
+                cudaFree(ptrs[slot]);
+            }
+
+            void *p = nullptr;
+            cudaMalloc(&p, want);
+            ptrs[slot] = p;
+            bytes[slot] = p ? want : 0;
+        }
+
+        return (FLOAT *) ptrs[slot];
+    }
+};
+
+static SoftScratch soft_scratch;
+
+enum {
+    SOFT_SCRATCH_POS1 = 0,
+    SOFT_SCRATCH_VAL1,
+    SOFT_SCRATCH_POS2,
+    SOFT_SCRATCH_VAL2,
+    SOFT_SCRATCH_COUNTS,
+    SOFT_SCRATCH_COTANGENT,
+    SOFT_SCRATCH_GPOS1,
+    SOFT_SCRATCH_GPOS2,
+    SOFT_SCRATCH_GW1,
+    SOFT_SCRATCH_GW2,
+    SOFT_SCRATCH_GSIGMA,
+};
+
+static Particles soft_particles(const FLOAT *positions, const FLOAT *values,
+                                size_t n, IndexValue index_value)
+{
+    Particles particles;
+    particles.positions = const_cast<FLOAT *>(positions);
+    particles.values = const_cast<FLOAT *>(values);
+    particles.size = n;
+    particles.index_value = index_value;
+    return particles;
+}
+
+template <ffi::DataType DT>
 ffi::Error count2SoftImpl(
     cudaStream_t stream,
-    ffi::Buffer<ffi::F64> positions1,
-    ffi::Buffer<ffi::F64> values1,
-    ffi::Buffer<ffi::F64> positions2,
-    ffi::Buffer<ffi::F64> values2,
-    ffi::ResultBuffer<ffi::F64> counts,
-    ffi::ResultBuffer<ffi::F64> buffer)
+    ffi::Buffer<DT> positions1,
+    ffi::Buffer<DT> values1,
+    ffi::Buffer<DT> positions2,
+    ffi::Buffer<DT> values2,
+    ffi::ResultBuffer<DT> counts,
+    ffi::ResultBuffer<DT> buffer)
 {
     Particles list_particles[MAX_NMESH];
     Mesh list_mesh[MAX_NMESH];
@@ -472,8 +569,47 @@ ffi::Error count2SoftImpl(
         list_mesh[imesh].original_index = nullptr;
     }
 
-    list_particles[0] = get_ffi_particles(positions1, values1, index_value2[0]);
-    list_particles[1] = get_ffi_particles(positions2, values2, index_value2[1]);
+    const size_t n1 = (size_t) positions1.dimensions().front();
+    const size_t n2 = (size_t) positions2.dimensions().front();
+
+    const FLOAT *p1 = nullptr;
+    const FLOAT *v1 = nullptr;
+    const FLOAT *p2 = nullptr;
+    const FLOAT *v2 = nullptr;
+    FLOAT *hist = nullptr;
+
+    if constexpr (DT == ffi::F64) {
+        p1 = positions1.typed_data();
+        v1 = values1.typed_data();
+        p2 = positions2.typed_data();
+        v2 = values2.typed_data();
+        hist = counts->typed_data();
+    }
+    else {
+        const size_t npos1 = ffi_elements(positions1);
+        const size_t nval1 = ffi_elements(values1);
+        const size_t npos2 = ffi_elements(positions2);
+        const size_t nval2 = ffi_elements(values2);
+
+        p1 = soft_scratch.f64(SOFT_SCRATCH_POS1, npos1);
+        soft_cast_f32_to_f64(const_cast<FLOAT *>(p1), positions1.typed_data(),
+                             npos1, stream);
+        v1 = soft_scratch.f64(SOFT_SCRATCH_VAL1, nval1);
+        soft_cast_f32_to_f64(const_cast<FLOAT *>(v1), values1.typed_data(),
+                             nval1, stream);
+        p2 = soft_scratch.f64(SOFT_SCRATCH_POS2, npos2);
+        soft_cast_f32_to_f64(const_cast<FLOAT *>(p2), positions2.typed_data(),
+                             npos2, stream);
+        v2 = soft_scratch.f64(SOFT_SCRATCH_VAL2, nval2);
+        soft_cast_f32_to_f64(const_cast<FLOAT *>(v2), values2.typed_data(),
+                             nval2, stream);
+
+        // count2_soft zeroes the histogram itself.
+        hist = soft_scratch.f64(SOFT_SCRATCH_COUNTS, (size_t) soft_spec2.nslots);
+    }
+
+    list_particles[0] = soft_particles(p1, v1, n1, index_value2[0]);
+    list_particles[1] = soft_particles(p2, v2, n2, index_value2[1]);
 
     DeviceMemoryBuffer membuffer;
     set_mem_buffer(&membuffer, buffer);
@@ -483,7 +619,12 @@ ffi::Error count2SoftImpl(
     set_mesh(list_particles, list_mesh, mattrs2, &membuffer, stream);
     const Count2Attrs attrs{mattrs2, battrs2, wattrs2, sattrs2, spattrs2};
     SoftBinSpec spec = soft_spec2;  // the kernel writes the staging path back into it
-    count2_soft(counts->typed_data(), list_mesh, attrs, spec, &membuffer, stream);
+    count2_soft(hist, list_mesh, attrs, spec, &membuffer, stream);
+
+    if constexpr (DT != ffi::F64) {
+        soft_cast_f64_to_f32(counts->typed_data(), hist,
+                             (size_t) soft_spec2.nslots, stream);
+    }
 
     cudaError_t last_error = cudaGetLastError();
     if (last_error != cudaSuccess) {
@@ -493,17 +634,23 @@ ffi::Error count2SoftImpl(
     return ffi::Error::Success();
 }
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    count2Softffi, count2SoftImpl,
-    ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
-        .Arg<ffi::Buffer<ffi::F64>>()
-        .Arg<ffi::Buffer<ffi::F64>>()
-        .Arg<ffi::Buffer<ffi::F64>>()
-        .Arg<ffi::Buffer<ffi::F64>>()
-        .Ret<ffi::Buffer<ffi::F64>>()
-        .Ret<ffi::Buffer<ffi::F64>>()
+#define CUCOUNT_DEFINE_SOFT_FFI(NAME, IMPL, TYPE)                            \
+XLA_FFI_DEFINE_HANDLER_SYMBOL(                                               \
+    NAME, IMPL<TYPE>,                                                        \
+    ffi::Ffi::Bind()                                                         \
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
 );
+
+CUCOUNT_DEFINE_SOFT_FFI(count2Softffi, count2SoftImpl, ffi::F64)
+CUCOUNT_DEFINE_SOFT_FFI(count2SoftF32ffi, count2SoftImpl, ffi::F32)
+
+#undef CUCOUNT_DEFINE_SOFT_FFI
 
 // -----------------------------------------------------------------------------
 // soft count2 adjoint FFI impl
@@ -513,22 +660,27 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // five gradients. Every gradient operand is zeroed here because the kernel
 // accumulates with atomics; the mesh keeps the slot -> input-index map the
 // scatter/reorder in set_mesh would otherwise destroy.
+//
+// A float32 call stages the cotangent and the five gradients in float64: the
+// adjoint cancels terms of order sigma^2 against each other, so narrowing it
+// would throw away much more than it throws away in the forward.
+template <ffi::DataType DT>
 ffi::Error count2SoftVjpImpl(
     cudaStream_t stream,
-    ffi::Buffer<ffi::F64> positions1,
-    ffi::Buffer<ffi::F64> values1,
-    ffi::Buffer<ffi::F64> positions2,
-    ffi::Buffer<ffi::F64> values2,
-    ffi::Buffer<ffi::F64> cotangent,
-    ffi::ResultBuffer<ffi::F64> grad_positions1,
-    ffi::ResultBuffer<ffi::F64> grad_positions2,
-    ffi::ResultBuffer<ffi::F64> grad_values1,
-    ffi::ResultBuffer<ffi::F64> grad_values2,
-    ffi::ResultBuffer<ffi::F64> grad_sigma,
-    ffi::ResultBuffer<ffi::F64> buffer)
+    ffi::Buffer<DT> positions1,
+    ffi::Buffer<DT> values1,
+    ffi::Buffer<DT> positions2,
+    ffi::Buffer<DT> values2,
+    ffi::Buffer<DT> cotangent,
+    ffi::ResultBuffer<DT> grad_positions1,
+    ffi::ResultBuffer<DT> grad_positions2,
+    ffi::ResultBuffer<DT> grad_values1,
+    ffi::ResultBuffer<DT> grad_values2,
+    ffi::ResultBuffer<DT> grad_sigma,
+    ffi::ResultBuffer<DT> buffer)
 {
-    const size_t n1 = positions1.dimensions().front();
-    const size_t n2 = positions2.dimensions().front();
+    const size_t n1 = (size_t) positions1.dimensions().front();
+    const size_t n2 = (size_t) positions2.dimensions().front();
 
     Particles list_particles[MAX_NMESH];
     Mesh list_mesh[MAX_NMESH];
@@ -541,19 +693,67 @@ ffi::Error count2SoftVjpImpl(
         list_mesh[imesh].original_index = nullptr;
     }
 
-    list_particles[0] = get_ffi_particles(positions1, values1, index_value2[0]);
-    list_particles[1] = get_ffi_particles(positions2, values2, index_value2[1]);
+    const FLOAT *p1 = nullptr;
+    const FLOAT *v1 = nullptr;
+    const FLOAT *p2 = nullptr;
+    const FLOAT *v2 = nullptr;
+    const FLOAT *g = nullptr;
+    FLOAT *gpos1 = nullptr;
+    FLOAT *gpos2 = nullptr;
+    FLOAT *gw1 = nullptr;
+    FLOAT *gw2 = nullptr;
+    FLOAT *gsigma = nullptr;
+
+    if constexpr (DT == ffi::F64) {
+        p1 = positions1.typed_data();
+        v1 = values1.typed_data();
+        p2 = positions2.typed_data();
+        v2 = values2.typed_data();
+        g = cotangent.typed_data();
+        gpos1 = grad_positions1->typed_data();
+        gpos2 = grad_positions2->typed_data();
+        gw1 = grad_values1->typed_data();
+        gw2 = grad_values2->typed_data();
+        gsigma = grad_sigma->typed_data();
+    }
+    else {
+        const size_t npos1 = ffi_elements(positions1);
+        const size_t nval1 = ffi_elements(values1);
+        const size_t npos2 = ffi_elements(positions2);
+        const size_t nval2 = ffi_elements(values2);
+        const size_t nc = (size_t) soft_spec2.nslots;
+
+        p1 = soft_scratch.f64(SOFT_SCRATCH_POS1, npos1);
+        soft_cast_f32_to_f64(const_cast<FLOAT *>(p1), positions1.typed_data(),
+                             npos1, stream);
+        v1 = soft_scratch.f64(SOFT_SCRATCH_VAL1, nval1);
+        soft_cast_f32_to_f64(const_cast<FLOAT *>(v1), values1.typed_data(),
+                             nval1, stream);
+        p2 = soft_scratch.f64(SOFT_SCRATCH_POS2, npos2);
+        soft_cast_f32_to_f64(const_cast<FLOAT *>(p2), positions2.typed_data(),
+                             npos2, stream);
+        v2 = soft_scratch.f64(SOFT_SCRATCH_VAL2, nval2);
+        soft_cast_f32_to_f64(const_cast<FLOAT *>(v2), values2.typed_data(),
+                             nval2, stream);
+
+        FLOAT *gc = soft_scratch.f64(SOFT_SCRATCH_COTANGENT, nc);
+        soft_cast_f32_to_f64(gc, cotangent.typed_data(), nc, stream);
+        g = gc;
+
+        gpos1 = soft_scratch.f64(SOFT_SCRATCH_GPOS1, NDIM * n1);
+        gpos2 = soft_scratch.f64(SOFT_SCRATCH_GPOS2, NDIM * n2);
+        gw1 = soft_scratch.f64(SOFT_SCRATCH_GW1, n1);
+        gw2 = soft_scratch.f64(SOFT_SCRATCH_GW2, n2);
+        gsigma = soft_scratch.f64(SOFT_SCRATCH_GSIGMA, 1);
+    }
+
+    list_particles[0] = soft_particles(p1, v1, n1, index_value2[0]);
+    list_particles[1] = soft_particles(p2, v2, n2, index_value2[1]);
 
     DeviceMemoryBuffer membuffer;
     set_mem_buffer(&membuffer, buffer);
     membuffer.nblocks = MAX_NBLOCKS;
     membuffer.nthreads_per_block = MAX_NTHREADS_PER_BLOCK * 16;
-
-    FLOAT *gpos1 = grad_positions1->typed_data();
-    FLOAT *gpos2 = grad_positions2->typed_data();
-    FLOAT *gw1 = grad_values1->typed_data();
-    FLOAT *gw2 = grad_values2->typed_data();
-    FLOAT *gsigma = grad_sigma->typed_data();
 
     CUDA_CHECK(cudaMemsetAsync(gpos1, 0, NDIM * n1 * sizeof(FLOAT), stream));
     CUDA_CHECK(cudaMemsetAsync(gpos2, 0, NDIM * n2 * sizeof(FLOAT), stream));
@@ -566,8 +766,18 @@ ffi::Error count2SoftVjpImpl(
     set_mesh(list_particles, list_mesh, mattrs2, &membuffer, stream, true);
 
     const Count2Attrs attrs{mattrs2, battrs2, wattrs2, sattrs2, spattrs2};
-    count2_soft_vjp(cotangent.typed_data(), gpos1, gpos2, gw1, gw2, gsigma,
+    count2_soft_vjp(g, gpos1, gpos2, gw1, gw2, gsigma,
                     list_mesh, attrs, soft_spec2, &membuffer, stream);
+
+    if constexpr (DT != ffi::F64) {
+        soft_cast_f64_to_f32(grad_positions1->typed_data(), gpos1,
+                             NDIM * n1, stream);
+        soft_cast_f64_to_f32(grad_positions2->typed_data(), gpos2,
+                             NDIM * n2, stream);
+        soft_cast_f64_to_f32(grad_values1->typed_data(), gw1, n1, stream);
+        soft_cast_f64_to_f32(grad_values2->typed_data(), gw2, n2, stream);
+        soft_cast_f64_to_f32(grad_sigma->typed_data(), gsigma, 1, stream);
+    }
 
     cudaError_t last_error = cudaGetLastError();
     if (last_error != cudaSuccess) {
@@ -577,22 +787,28 @@ ffi::Error count2SoftVjpImpl(
     return ffi::Error::Success();
 }
 
-XLA_FFI_DEFINE_HANDLER_SYMBOL(
-    count2SoftVjpffi, count2SoftVjpImpl,
-    ffi::Ffi::Bind()
-        .Ctx<ffi::PlatformStream<cudaStream_t>>()
-        .Arg<ffi::Buffer<ffi::F64>>()
-        .Arg<ffi::Buffer<ffi::F64>>()
-        .Arg<ffi::Buffer<ffi::F64>>()
-        .Arg<ffi::Buffer<ffi::F64>>()
-        .Arg<ffi::Buffer<ffi::F64>>()
-        .Ret<ffi::Buffer<ffi::F64>>()
-        .Ret<ffi::Buffer<ffi::F64>>()
-        .Ret<ffi::Buffer<ffi::F64>>()
-        .Ret<ffi::Buffer<ffi::F64>>()
-        .Ret<ffi::Buffer<ffi::F64>>()
-        .Ret<ffi::Buffer<ffi::F64>>()
+#define CUCOUNT_DEFINE_SOFT_VJP_FFI(NAME, IMPL, TYPE)                        \
+XLA_FFI_DEFINE_HANDLER_SYMBOL(                                               \
+    NAME, IMPL<TYPE>,                                                        \
+    ffi::Ffi::Bind()                                                         \
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
 );
+
+CUCOUNT_DEFINE_SOFT_VJP_FFI(count2SoftVjpffi, count2SoftVjpImpl, ffi::F64)
+CUCOUNT_DEFINE_SOFT_VJP_FFI(count2SoftVjpF32ffi, count2SoftVjpImpl, ffi::F32)
+
+#undef CUCOUNT_DEFINE_SOFT_VJP_FFI
 
 // -----------------------------------------------------------------------------
 // count3close FFI impl
@@ -823,12 +1039,17 @@ PYBIND11_MODULE(ffi_cuda, m) {
         py::arg("soft_sigma") = 0.,
         py::arg("soft_cutoff") = 1e-13,
         py::arg("soft_taps") = "exact",
+        py::arg("soft_accum") = "float32",
         py::arg("soft_mu_sigma") = 0.,
         py::arg("soft_mu_bins") = 0,
         py::arg("soft_mu_edges") = py::none());
 
     m.def("count2_soft", []() { return EncapsulateFfiCall(count2Softffi); });
     m.def("count2_soft_vjp", []() { return EncapsulateFfiCall(count2SoftVjpffi); });
+    // float32 twins, for callers that run with JAX_ENABLE_X64 unset: the samples
+    // are widened here and the histogram is narrowed once on the way out.
+    m.def("count2_soft_f32", []() { return EncapsulateFfiCall(count2SoftF32ffi); });
+    m.def("count2_soft_vjp_f32", []() { return EncapsulateFfiCall(count2SoftVjpF32ffi); });
 
     // backward-compatible aliases
     m.def("set_attrs", &set_count2_attrs_py, "Set count2 attributes",

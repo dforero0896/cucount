@@ -391,6 +391,14 @@ not folded, so odd multipoles keep their sign): `soft_mu_bins` sets its resoluti
 recurrence path. The small `soft_sigma -> 0` limit is the honest one for multipoles:
 softening mu shifts the poles at `O(sigma_mu^2)`, so it is opt-in.
 
+Samples may be `float32` or `float64`; `cucount.jax.soft` picks the matching FFI entry point
+from the particle dtype, so soft counts work without setting `JAX_ENABLE_X64` (the float32
+samples are widened once at the boundary and the result narrowed once on the way out --- the
+arithmetic stays `float64`). Independently, `soft_accum` selects the precision of the
+per-block shared-memory histogram: `'float32'` (the default) is faster because Ampere's
+`atomicAdd(double*)` is a compare-and-swap loop, and costs a few `1e-7` relative on the
+counts; `'float64'` restores the bit-comparable path for conservation tests.
+
 The soft kernel is CUDA-only and rejects spin, angular upweights and split/jackknife
 requests instead of silently ignoring them. Runnable examples:
 `examples/soft_counts_lsstypes.py` (this frontend, isotropic and multipoles),

@@ -25,6 +25,14 @@ from cucount.numpy import (BinAttrs, MeshAttrs, Particles, cudalib)
 from cucount.numpy import (count2, count2_soft, count2_soft_vjp, mu_grid,
                            mu_kmax, mu_spec, soft_mu_weights, soft_weights)
 
+# The reference tests below check the softmax math, the window and the adjoint
+# against exact references, so they pin the exact accumulator. The default
+# float32 shared-memory tile costs a few 1e-7 relative on the counts (see
+# test_soft_s_cuda.py::test_float32_accumulation_is_the_default); at 1e-12
+# tolerances that rounding, not the model, is what a failure would measure.
+ACC = 'float64'
+
+
 needs_cuda = pytest.mark.skipif(
     cudalib is None or cudalib.device_count() == 0,
     reason='CUDA extension not built, or no GPU visible')
@@ -99,7 +107,7 @@ def test_matches_brute_force_for_every_line_of_sight():
     for los in ('z', 'x', 'midpoint', 'firstpoint', 'endpoint'):
         p1, p2, ba, ma = _setup(ells=ells, los=los, n1=40, n2=35)
         got = np.asarray(count2_soft(p1, p2, battrs=ba, mattrs=ma,
-                                     soft_cutoff=CUTOFF)['weight'])
+                                     soft_cutoff=CUTOFF, soft_accum=ACC)['weight'])
         want = _brute(p1, p2, EDGES, ells, los)
         assert got.shape == want.shape
         assert np.allclose(got, want, rtol=1e-11, atol=1e-12), los
@@ -111,7 +119,7 @@ def test_matches_brute_force_with_a_finite_mu_width():
     p1, p2, ba, ma = _setup(ells=ells, los='midpoint', n1=30, n2=25)
     got = np.asarray(count2_soft(p1, p2, battrs=ba, mattrs=ma,
                                  soft_cutoff=CUTOFF,
-                                 soft_mu_sigma=0.1)['weight'])
+                                 soft_mu_sigma=0.1, soft_accum=ACC)['weight'])
     want = _brute(p1, p2, EDGES, ells, 'midpoint', soft_mu_sigma=0.1)
     assert np.allclose(got, want, rtol=1e-11, atol=1e-12)
 
@@ -120,10 +128,10 @@ def test_matches_brute_force_with_a_finite_mu_width():
 def test_monopole_is_the_soft_s_count():
     """M_0 = 1 exactly, so asking for ell=0 must not change the answer."""
     p1, p2, ba, ma = _setup(ells=ELLS, los='z', n1=60, n2=50)
-    soft = count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF)
+    soft = count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF, soft_accum=ACC)
     ba_s = BinAttrs(s=EDGES)
     ma_s = MeshAttrs(p1, p2, boxsize=BOX, battrs=ba_s, periodic=True)
-    iso = count2_soft(p1, p2, battrs=ba_s, mattrs=ma_s, soft_cutoff=CUTOFF)
+    iso = count2_soft(p1, p2, battrs=ba_s, mattrs=ma_s, soft_cutoff=CUTOFF, soft_accum=ACC)
     ells = [int(e) for e in np.asarray(ba.coords('pole'))]
     i0 = ells.index(0)
     mono = np.asarray(soft['weight'])[:, i0]
@@ -139,7 +147,7 @@ def test_refining_the_mu_grid_approaches_hard_multipoles():
     p1, p2, ba, ma = _setup(ells=ells, los='z', n1=40, n2=35)
     soft = np.asarray(count2_soft(p1, p2, battrs=ba, mattrs=ma,
                                   soft_cutoff=CUTOFF, soft_mu_sigma=1e-3,
-                                  soft_mu_bins=1024)['weight'])
+                                  soft_mu_bins=1024, soft_accum=ACC)['weight'])
     hard = np.asarray(count2(p1, p2, battrs=ba, mattrs=ma)['weight'])
     # Per-bin values differ because s is still smoothed: sigma -> 0 is a limit of
     # the *multipole moments*, so the s bins are summed over. The mu profile also
@@ -159,7 +167,7 @@ def test_adjoint_matches_central_differences():
         a = Particles(pos1, w1)
         b = Particles(pos2, w2)
         hist = np.asarray(count2_soft(a, b, battrs=ba, mattrs=ma,
-                                      soft_cutoff=CUTOFF)['weight'])
+                                      soft_cutoff=CUTOFF, soft_accum=ACC)['weight'])
         return float((hist * g).sum())
 
     pos1 = np.asarray(p1.positions)
@@ -167,7 +175,7 @@ def test_adjoint_matches_central_differences():
     w1 = np.asarray(p1.values[0])
     w2 = np.asarray(p2.values[0])
     adj = count2_soft_vjp(p1, p2, battrs=ba, cotangent=g, mattrs=ma,
-                          soft_cutoff=CUTOFF)
+                          soft_cutoff=CUTOFF, soft_accum=ACC)
 
     h = 1e-6
     for name, base, key in (('pos1', pos1, 'grad_position1'),
@@ -205,14 +213,14 @@ def test_odd_multipoles_are_differentiable():
     rng = np.random.default_rng(4)
     g = rng.normal(size=(EDGES.size - 1, ells.size))
     adj = count2_soft_vjp(p1, p2, battrs=ba, cotangent=g, mattrs=ma,
-                          soft_cutoff=CUTOFF)
+                          soft_cutoff=CUTOFF, soft_accum=ACC)
     pos1 = np.asarray(p1.positions)
     h = 1e-6
     i, ax = 3, 1
 
     def loss(pos):
         hist = np.asarray(count2_soft(Particles(pos, p1.values[0]), p2, battrs=ba,
-                                      mattrs=ma, soft_cutoff=CUTOFF)['weight'])
+                                      mattrs=ma, soft_cutoff=CUTOFF, soft_accum=ACC)['weight'])
         return float((hist * g).sum())
 
     plus, minus = pos1.copy(), pos1.copy()
@@ -228,7 +236,7 @@ def test_odd_multipoles_are_differentiable():
 def test_meta_reports_the_multipole_configuration():
     p1, p2, ba, ma = _setup(ells=ELLS, los='z', n1=20, n2=15)
     meta = count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF,
-                       soft_mu_sigma=0.1)['soft']
+                       soft_mu_sigma=0.1, soft_accum=ACC)['soft']
     assert meta['multipoles'] == [int(e) for e in ELLS]
     assert meta['los'] == 'z'
     centres, sigma_mu, _ = mu_grid(0.1, 0)
@@ -244,7 +252,7 @@ def test_rejects_a_pole_axis_without_a_line_of_sight():
     ba = BinAttrs(s=EDGES, pole=(np.array([0, 2]), ''))
     ma = MeshAttrs(p1, p2, boxsize=BOX, battrs=ba, periodic=True)
     with pytest.raises(ValueError, match='line of sight'):
-        count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF)
+        count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF, soft_accum=ACC)
 
 
 @needs_cuda
@@ -253,7 +261,7 @@ def test_rejects_multipoles_out_of_range():
     ba = BinAttrs(s=EDGES, pole=(np.array([0, 9]), 'z'))
     ma = MeshAttrs(p1, p2, boxsize=BOX, battrs=ba, periodic=True)
     with pytest.raises(ValueError, match='multipoles up to ell'):
-        count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF)
+        count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF, soft_accum=ACC)
 
 
 def test_soft_mu_weights_is_normalised_at_ell_zero():
@@ -289,9 +297,9 @@ def test_uniform_mu_edges_reproduce_the_internal_grid():
     """Arithmetic edges must be *identical* to the default grid, i.e. still run
     the two-exp recurrence path and not the general one."""
     p1, p2, ba, ma = _setup(ells=np.array([0, 2, 4]), n1=40, n2=35)
-    internal = count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF)
+    internal = count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF, soft_accum=ACC)
     edges = count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF,
-                        soft_mu_edges=MU_EDGES_UNIFORM)
+                        soft_mu_edges=MU_EDGES_UNIFORM, soft_accum=ACC)
     # Same formula, same two-exp recurrence: equal to rounding (the edges carry a
     # 1-ulp difference in the derived mu width).
     assert np.allclose(np.asarray(edges['weight']), np.asarray(internal['weight']),
@@ -310,13 +318,13 @@ def test_non_uniform_mu_edges_match_brute_force():
     ells = np.array([0, 2, 4])
     p1, p2, ba, ma = _setup(ells=ells, n1=40, n2=35)
     got = np.asarray(count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF,
-                                 soft_mu_edges=MU_EDGES_COS)['weight'])
+                                 soft_mu_edges=MU_EDGES_COS, soft_accum=ACC)['weight'])
     want = _brute(p1, p2, EDGES, ells, 'z', soft_mu_edges=MU_EDGES_COS)
     assert got.shape == want.shape
     assert np.allclose(got, want, rtol=1e-10, atol=1e-12)
 
     meta = count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF,
-                       soft_mu_edges=MU_EDGES_COS)['soft']
+                       soft_mu_edges=MU_EDGES_COS, soft_accum=ACC)['soft']
     assert meta['mu_uniform'] is False
     assert meta['mu_sigma_kind'] == 'width'
     assert meta['mu_taps'] == -1          # the window adapts, so no fixed count
@@ -324,7 +332,7 @@ def test_non_uniform_mu_edges_match_brute_force():
 
     got = np.asarray(count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF,
                                  soft_mu_edges=MU_EDGES_COS,
-                                 soft_mu_sigma=0.2)['weight'])
+                                 soft_mu_sigma=0.2, soft_accum=ACC)['weight'])
     want = _brute(p1, p2, EDGES, ells, 'z', soft_mu_sigma=0.2,
                   soft_mu_edges=MU_EDGES_COS)
     assert np.allclose(got, want, rtol=1e-10, atol=1e-12)
@@ -338,7 +346,7 @@ def test_partial_mu_edges_leave_pairs_to_the_boundary_cell():
     edges = np.linspace(0.0, 1.0, 11)
     p1, p2, ba, ma = _setup(ells=ells, n1=30, n2=25)
     got = np.asarray(count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF,
-                                 soft_mu_edges=edges)['weight'])
+                                 soft_mu_edges=edges, soft_accum=ACC)['weight'])
     want = _brute(p1, p2, EDGES, ells, 'z', soft_mu_edges=edges)
     assert np.allclose(got, want, rtol=1e-10, atol=1e-12)
     # folded mu would make M_1 vanish in an autocorrelation; unfolded it need not
@@ -352,7 +360,7 @@ def test_adjoint_with_non_uniform_mu_edges_matches_central_differences():
     rng = np.random.default_rng(11)
     g = rng.normal(size=(EDGES.size - 1, ells.size))
     adj = count2_soft_vjp(p1, p2, battrs=ba, cotangent=g, mattrs=ma,
-                          soft_cutoff=CUTOFF, soft_mu_edges=MU_EDGES_COS)
+                          soft_cutoff=CUTOFF, soft_mu_edges=MU_EDGES_COS, soft_accum=ACC)
     pos1 = np.asarray(p1.positions)
     w1 = np.asarray(p1.values[0])
     h = 1e-6
@@ -360,7 +368,7 @@ def test_adjoint_with_non_uniform_mu_edges_matches_central_differences():
     def loss(pos):
         hist = np.asarray(count2_soft(Particles(pos, w1), p2, battrs=ba,
                                       mattrs=ma, soft_cutoff=CUTOFF,
-                                      soft_mu_edges=MU_EDGES_COS)['weight'])
+                                      soft_mu_edges=MU_EDGES_COS, soft_accum=ACC)['weight'])
         return float((hist * g).sum())
 
     # a few coordinates are enough: this pins the per-cell sigma chain rule
@@ -379,10 +387,10 @@ def test_adjoint_with_non_uniform_mu_edges_matches_central_differences():
         minus[i] -= h
         lp = float((np.asarray(count2_soft(Particles(pos1, plus), p2, battrs=ba,
                                            mattrs=ma, soft_cutoff=CUTOFF,
-                                           soft_mu_edges=MU_EDGES_COS)['weight']) * g).sum())
+                                           soft_mu_edges=MU_EDGES_COS, soft_accum=ACC)['weight']) * g).sum())
         lm = float((np.asarray(count2_soft(Particles(pos1, minus), p2, battrs=ba,
                                            mattrs=ma, soft_cutoff=CUTOFF,
-                                           soft_mu_edges=MU_EDGES_COS)['weight']) * g).sum())
+                                           soft_mu_edges=MU_EDGES_COS, soft_accum=ACC)['weight']) * g).sum())
         fd[i] = (lp - lm) / (2 * h)
     assert np.allclose(np.asarray(adj['grad_weight1']), fd, rtol=1e-5, atol=1e-7)
 
@@ -392,7 +400,7 @@ def test_mu_edges_are_rejected_when_malformed():
     p1, p2, ba, ma = _setup(ells=np.array([0, 2]), n1=10, n2=9)
 
     def call(**kw):
-        return count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF, **kw)
+        return count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF, **kw, soft_accum=ACC)
 
     with pytest.raises(ValueError, match='not both'):
         call(soft_mu_bins=40, soft_mu_edges=MU_EDGES_UNIFORM)
