@@ -20,6 +20,14 @@ jax.config.update('jax_enable_x64', True)  # counts and positions are float64
 
 from cucount import jax as cjax  # noqa: E402
 
+# The reference tests below check the softmax math, the window and the adjoint
+# against exact references, so they pin the exact accumulator. The default
+# float32 shared-memory tile costs a few 1e-7 relative on the counts (see
+# test_soft_s_cuda.py::test_float32_accumulation_is_the_default); at 1e-12
+# tolerances that rounding, not the model, is what a failure would measure.
+ACC = 'float64'
+
+
 
 def _gpu_devices():
     try:
@@ -57,7 +65,7 @@ def _reference_counts(pos1, pos2, w1, w2, battrs, mattrs, sigma=SIGMA):
     p1 = Particles(np.asarray(pos1), None if w1 is None else np.asarray(w1))
     p2 = Particles(np.asarray(pos2), None if w2 is None else np.asarray(w2))
     return nsoft.count2_soft(p1, p2, battrs=battrs, soft_sigma=sigma, soft_cutoff=CUTOFF,
-                             mattrs=mattrs, backend='cuda')['weight']
+                             mattrs=mattrs, backend='cuda', soft_accum=ACC)['weight']
 
 
 def _jax_counts(pos1, w1, pos2, w2, battrs, mattrs, sigma=SIGMA):
@@ -66,7 +74,7 @@ def _jax_counts(pos1, w1, pos2, w2, battrs, mattrs, sigma=SIGMA):
     p1 = cjax.Particles(pos1, w1)
     p2 = cjax.Particles(pos2, w2)
     return cjax.count2_soft(p1, p2, battrs=battrs, soft_sigma=sigma, soft_cutoff=CUTOFF,
-                            mattrs=mattrs, backend='cuda')['weight']
+                            mattrs=mattrs, backend='cuda', soft_accum=ACC)['weight']
 
 
 @needs_soft_jax
@@ -146,7 +154,7 @@ def test_autocorrelation_gradient_is_symmetric():
         part = Particles(np.asarray(p), w)
         return np.sum(nsoft.count2_soft(part, part, battrs=battrs, soft_sigma=SIGMA,
                                         soft_cutoff=CUTOFF, mattrs=mattrs,
-                                        backend='cuda')['weight'] * cot)
+                                        backend='cuda', soft_accum=ACC)['weight'] * cot)
 
     grad = jax.grad(lambda p: (_jax_counts(p, w, p, w, battrs, mattrs) * cot).sum())(pos)
 
@@ -183,7 +191,7 @@ def test_unweighted_input_matches_unit_weights():
     p1, p2 = cjax.Particles(pos1), cjax.Particles(pos2)
     got = np.asarray(cjax.count2_soft(p1, p2, battrs=battrs, soft_sigma=SIGMA,
                                       soft_cutoff=CUTOFF, mattrs=mattrs,
-                                      backend='cuda')['weight'])
+                                      backend='cuda', soft_accum=ACC)['weight'])
     expected = _reference_counts(pos1, pos2, np.ones(pos1.shape[0]), np.ones(pos2.shape[0]),
                                  battrs, mattrs)
     np.testing.assert_allclose(got, expected, rtol=1e-12, atol=1e-12)
@@ -261,7 +269,7 @@ def test_sharded_counts_and_gradients_match_single_device():
     ref = np.asarray(_reference_counts(pos, pos, w, w, battrs, mattrs))
     vjp = nsoft.count2_soft_vjp(
         Particles(pos, w), Particles(pos, w), battrs=battrs, cotangent=cot,
-        soft_sigma=SIGMA, soft_cutoff=CUTOFF, mattrs=mattrs, backend='cuda')
+        soft_sigma=SIGMA, soft_cutoff=CUTOFF, mattrs=mattrs, backend='cuda', soft_accum=ACC)
     ref_gpos = np.asarray(vjp['grad_position1']) + np.asarray(vjp['grad_position2'])
     ref_gw = (np.asarray(vjp['grad_weight1']).reshape(-1)
               + np.asarray(vjp['grad_weight2']).reshape(-1))
@@ -273,7 +281,7 @@ def test_sharded_counts_and_gradients_match_single_device():
         def loss(pp):
             counts = cjax.count2_soft(pp, pp, battrs=battrs, soft_sigma=SIGMA,
                                       soft_cutoff=CUTOFF, mattrs=mattrs,
-                                      backend='cuda')['weight']
+                                      backend='cuda', soft_accum=ACC)['weight']
             return (counts * cot).sum()
 
         value, grad = jax.value_and_grad(loss)(pj)
@@ -283,6 +291,34 @@ def test_sharded_counts_and_gradients_match_single_device():
                                rtol=1e-12, atol=1e-9 * np.abs(ref_gpos).max())
     np.testing.assert_allclose(np.asarray(grad.values[0]).reshape(-1), ref_gw,
                                rtol=1e-12, atol=1e-9 * np.abs(ref_gw).max())
+
+
+@needs_soft_jax
+def test_float32_accumulation_is_the_default_and_matches_numpy():
+    """The jax frontend's default accum must be the numpy frontend's default.
+
+    Both sides leave ``soft_accum`` unset, so this pins the shared default
+    ('float32') and the accuracy of the FFI path against the pybind path.
+    """
+    pos1, pos2, w1, w2, battrs, mattrs = _setup(seed=13)
+    expected = nsoft.count2_soft(Particles(pos1, w1), Particles(pos2, w2),
+                                 battrs=battrs, soft_sigma=SIGMA,
+                                 soft_cutoff=CUTOFF, mattrs=mattrs,
+                                 backend='cuda')
+    got = cjax.count2_soft(cjax.Particles(pos1, w1), cjax.Particles(pos2, w2),
+                           battrs=battrs, soft_sigma=SIGMA, soft_cutoff=CUTOFF,
+                           mattrs=mattrs, backend='cuda')
+    assert got['soft']['accum'] == expected['soft']['accum'] == 'float32'
+    # Not 1e-12: the two paths differ only in the order the per-block partials are
+    # atomically added to the float64 histogram, which float32 partials make
+    # visible at the 1e-8 level. The tolerance below is the accumulator's.
+    np.testing.assert_allclose(np.asarray(got['weight']),
+                               np.asarray(expected['weight']), rtol=1e-5, atol=0)
+    exact = nsoft.count2_soft(Particles(pos1, w1), Particles(pos2, w2),
+                              battrs=battrs, soft_sigma=SIGMA,
+                              soft_cutoff=CUTOFF, mattrs=mattrs,
+                              backend='cuda', soft_accum=ACC)['weight']
+    np.testing.assert_allclose(np.asarray(got['weight']), exact, rtol=1e-5, atol=0)
 
 
 @needs_soft_jax
@@ -338,7 +374,7 @@ def test_soft_mu_multipole_gradient_matches_the_numpy_vjp():
 
     ref = nsoft.count2_soft_vjp(p1, p2, battrs=battrs, cotangent=cot,
                                 soft_sigma=SIGMA, soft_cutoff=CUTOFF,
-                                mattrs=mattrs, backend='cuda')
+                                mattrs=mattrs, backend='cuda', soft_accum=ACC)
     # argnums are ordered to match the destructuring, not the argument list.
     gpos1, gpos2, gw1, gw2 = jax.grad(
         lambda a, wa, b, wb: (_jax_counts(a, wa, b, wb, battrs, mattrs) * cot).sum(),
@@ -380,21 +416,21 @@ def test_soft_mu_edges_match_the_numpy_frontend_and_vjp():
 
     ref = nsoft.count2_soft(p1, p2, battrs=battrs, mattrs=mattrs, backend='cuda',
                             soft_sigma=SIGMA, soft_cutoff=CUTOFF,
-                            soft_mu_edges=mu_edges)
+                            soft_mu_edges=mu_edges, soft_accum=ACC)
     assert ref['soft']['mu_uniform'] is False
 
     def counts(a, wa, b, wb):
         return cjax.count2_soft(cjax.Particles(a, wa), cjax.Particles(b, wb),
                                 battrs=battrs, mattrs=mattrs, backend='cuda',
                                 soft_sigma=SIGMA, soft_cutoff=CUTOFF,
-                                soft_mu_edges=mu_edges)
+                                soft_mu_edges=mu_edges, soft_accum=ACC)
 
     got = np.asarray(counts(pos1, w1, pos2, w2)['weight'])
     np.testing.assert_allclose(got, np.asarray(ref['weight']), rtol=1e-12, atol=1e-12)
 
     vjp = nsoft.count2_soft_vjp(p1, p2, battrs=battrs, cotangent=cot, mattrs=mattrs,
                                 backend='cuda', soft_sigma=SIGMA,
-                                soft_cutoff=CUTOFF, soft_mu_edges=mu_edges)
+                                soft_cutoff=CUTOFF, soft_mu_edges=mu_edges, soft_accum=ACC)
     gpos1, gpos2, gw1, gw2 = jax.grad(
         lambda a, wa, b, wb: (counts(a, wa, b, wb)['weight'] * cot).sum(),
         argnums=(0, 2, 1, 3))(pos1, w1, pos2, w2)
@@ -431,7 +467,7 @@ def test_sharded_soft_mu_gradients_match_single_device():
     ref = np.asarray(_reference_counts(pos, pos, w, w, battrs, mattrs))
     vjp = nsoft.count2_soft_vjp(Particles(pos, w), Particles(pos, w), battrs=battrs,
                                 cotangent=cot, soft_sigma=SIGMA, soft_cutoff=CUTOFF,
-                                mattrs=mattrs, backend='cuda')
+                                mattrs=mattrs, backend='cuda', soft_accum=ACC)
     ref_gpos = np.asarray(vjp['grad_position1']) + np.asarray(vjp['grad_position2'])
     ref_gw = (np.asarray(vjp['grad_weight1']).reshape(-1)
               + np.asarray(vjp['grad_weight2']).reshape(-1))
@@ -443,7 +479,7 @@ def test_sharded_soft_mu_gradients_match_single_device():
         def loss(pp):
             counts = cjax.count2_soft(pp, pp, battrs=battrs, soft_sigma=SIGMA,
                                       soft_cutoff=CUTOFF, mattrs=mattrs,
-                                      backend='cuda')['weight']
+                                      backend='cuda', soft_accum=ACC)['weight']
             return (counts * cot).sum()
 
         value, grad = jax.value_and_grad(loss)(pj)

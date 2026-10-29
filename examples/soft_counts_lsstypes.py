@@ -106,6 +106,8 @@ def main():
     print(f'\nweight conservation: hard {hard_c.sum():.10g}, '
           f'soft {soft_c.sum():.10g}, soft wide {wide_c.sum():.10g} '
           f'(relative spread {abs(soft_c.sum() / hard_c.sum() - 1):.2e})')
+    print('  the default float32 shared-memory accumulator contributes ~1e-7; '
+          "pass soft_accum='float64' for a bit-comparable histogram")
 
     # --- soft multipoles --------------------------------------------------
     battrs_p = BinAttrs(s=EDGES, pole=(ELLS, LOS))
@@ -162,7 +164,8 @@ def main():
     counts_np = np.asarray(first)
     print(f'\njit: cold {1e3 * cold:.1f} ms, warm {1e3 * warm:.1f} ms')
     print(f'  jit vs eager counts: max |diff| = '
-          f'{np.max(np.abs(counts_np - soft_c)):.2e}')
+          f'{np.max(np.abs(counts_np - soft_c)):.2e} '
+          f'(relative {np.max(np.abs(counts_np - soft_c)) / np.max(soft_c):.2e})')
 
     # d/dw sum(counts^2)/2 hands the adjoint the cotangent ``counts``
     loss = jax.jit(jax.grad(lambda ww: jnp.sum(jit_counts(pos, ww) ** 2) / 2))

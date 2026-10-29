@@ -102,6 +102,7 @@ def _soft_axes(battrs):
 
 
 def _soft_spec(edges, soft_sigma=None, soft_cutoff=1e-13, soft_taps='exact',
+               soft_accum='float32',
                soft_mu_sigma=None, soft_mu_bins=0, ells=None, los=None,
                soft_mu_edges=None):
     """Resolve the soft request the way the kernel will (sigma, window, taps)."""
@@ -109,6 +110,8 @@ def _soft_spec(edges, soft_sigma=None, soft_cutoff=1e-13, soft_taps='exact',
         raise ValueError(f'soft_cutoff must be in (0, 1), got {soft_cutoff!r}')
     if soft_taps not in ('exact', 'fast'):
         raise ValueError(f"soft_taps must be 'exact' or 'fast', got {soft_taps!r}")
+    if soft_accum not in ('float32', 'float64'):
+        raise ValueError(f"soft_accum must be 'float32' or 'float64', got {soft_accum!r}")
     nbins = edges.size - 1
     ds = edges[1] - edges[0]
     uniform = is_uniform(edges)
@@ -124,6 +127,7 @@ def _soft_spec(edges, soft_sigma=None, soft_cutoff=1e-13, soft_taps='exact',
     meta = dict(sigma=sigma, sigma_units='separation',
                 sigma_kind='width' if width_scaled else 'absolute',
                 uniform=uniform, fast_taps=soft_taps == 'fast',
+                accum=soft_accum,
                 cutoff=float(soft_cutoff), kmax=kmax,
                 taps=(2 * kmax + 1) if uniform else -1, nbins=nbins,
                 multipoles=[] if ells is None else [int(e) for e in ells],
@@ -169,6 +173,7 @@ def _vjp_bufsize(particles, mattrs, nbins=0, mu_entries=0):
 @default_sharding_mesh
 def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = None,
                 soft_cutoff: float = 1e-13, soft_taps: str = 'exact',
+                soft_accum: str = 'float32',
                 soft_mu_sigma: float = None, soft_mu_bins: int = 0,
                 soft_mu_edges=None,
                 wattrs: WeightAttrs = None,
@@ -176,6 +181,13 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
                 mattrs: MeshAttrs = None, backend: str = None,
                 sharding_mesh: jax.sharding.Mesh = None):
     """Differentiable soft pair counts.
+
+    Positions and weights may be float32 or float64; the counts and gradients come
+    back in the dtype they were given. A float32 call does *not* lower the kernel's
+    precision -- separations, logits and the accumulation stay float64, only the
+    samples are widened on entry and the results narrowed once on exit -- so
+    nothing changes about pair selection. This is what makes the function usable
+    with JAX_ENABLE_X64 unset.
 
     Drop-in neighbour of :func:`cucount.jax.count2` for the isotropic soft case:
     same particle containers, same ``{'weight': counts}`` return, and it can be
@@ -204,6 +216,13 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
         ``~2 sqrt(2 ln(1/cutoff)) sigma/ds + 1``. Precision/speed knob: 1e-13
         reproduces the full softmax to double precision, 1e-6 is a fast
         production choice.
+    soft_taps, soft_accum : {'exact', 'fast'}, {'float32', 'float64'}
+        Speed knobs. ``soft_taps='fast'`` swaps the general path's ``exp`` for
+        ``__expf`` (~1e-6 relative in the weights). ``soft_accum`` is the type of
+        the shared-memory per-block histograms: ``'float32'`` (default) is
+        1.5-3x faster than ``'float64'`` on Ampere and later, at the cost of a
+        few 1e-7 relative when each block adds its partial sum to the output.
+        Pass ``'float64'`` for bit-comparable runs (conservation at 1e-15).
     soft_mu_sigma : float, optional
         Width of the mu kernel, in mu units, when ``battrs`` carries a pole axis.
         ``None`` (or 0) means half a mu bin. The mu axis defaults to a uniform
@@ -255,7 +274,7 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
         raise NotImplementedError('split/jackknife counts are not served by the soft kernel yet')
 
     edges, ells, los = _soft_axes(battrs)
-    spec = _soft_spec(edges, soft_sigma, soft_cutoff, soft_taps,
+    spec = _soft_spec(edges, soft_sigma, soft_cutoff, soft_taps, soft_accum,
                       soft_mu_sigma, soft_mu_bins, ells, los, soft_mu_edges)
     nbins = spec['nbins']
     slots = spec['slots']
@@ -275,6 +294,7 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
                                      soft_sigma=0. if soft_sigma is None else float(soft_sigma),
                                      soft_cutoff=float(soft_cutoff),
                                      soft_taps=str(soft_taps),
+                                     soft_accum=str(soft_accum),
                                      soft_mu_sigma=0. if soft_mu_sigma is None else float(soft_mu_sigma),
                                      soft_mu_bins=int(soft_mu_bins),
                                      soft_mu_edges=soft_mu_edges)
@@ -284,9 +304,25 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
     has_weights = [bool(p.index_value('individual_weight')) for p in particles]
     meshsize = int(np.prod(np.asarray(mattrs.meshsize, dtype=np.int64)))
 
+    # The kernel is float64 throughout, but the FFI entry points come in two
+    # dtypes: a float32 call widens its samples on entry and narrows the result on
+    # exit, so the jax frontend works with JAX_ENABLE_X64 unset (the default) as
+    # well. Everything the *caller* sees -- operands, counts, gradients -- takes
+    # the dtype of the samples it was given.
+    sample_dtype = jnp.dtype(particles[0].positions.dtype)
+    if sample_dtype not in (jnp.float32, jnp.float64):
+        raise TypeError(f'soft counting needs float32 or float64 particles, got {sample_dtype}')
+    sample_width = sample_dtype.itemsize
+    ffi_names = ('count2_soft' if sample_dtype == jnp.float64 else 'count2_soft_f32',
+                 'count2_soft_vjp' if sample_dtype == jnp.float64 else 'count2_soft_vjp_f32')
+
+    def _scratch(width, bytes_needed):
+        """Element count for a scratch buffer carrying ``bytes_needed`` bytes."""
+        return (bytes_needed + width - 1) // width
+
     def _values(p):
         values = _stack_values(p.values, np=jnp)
-        return jnp.zeros((p.positions.shape[0], 0), jnp.float64) if values is None else values
+        return jnp.zeros((p.positions.shape[0], 0), sample_dtype) if values is None else values
 
     def _operands(ps):
         """Positions (and weight columns, when present) for each catalogue."""
@@ -315,10 +351,11 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
         n = _lens(ops)
         # The kernel writes one flat slot per (s bin, multipole), so the FFI
         # buffer is 1-D and the public shape is restored outside the kernel.
-        counts_type = jax.ShapeDtypeStruct((slots,), jnp.float64)
+        counts_type = jax.ShapeDtypeStruct((slots,), sample_dtype)
         buffer_type = jax.ShapeDtypeStruct(
-            (_bufsize(meshsize, n, nbins, mu_entries),), jnp.float64)
-        fwd = jax.ffi.ffi_call('count2_soft' + suffix, (counts_type, buffer_type))
+            (_scratch(sample_width, _bufsize(meshsize, n, nbins, mu_entries)),),
+            sample_dtype)
+        fwd = jax.ffi.ffi_call(ffi_names[0] + suffix, (counts_type, buffer_type))
         return fwd(*ops)[0].reshape(shape)
 
     def _local_bwd(ops, cotangent):
@@ -326,15 +363,16 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
         # All gradients are FFI result buffers (XLA allocates them and zero-fills
         # nothing, so the kernel zeroes them itself before accumulating).
         outputs = (
-            jax.ShapeDtypeStruct((n[0] * NDIM,), jnp.float64),
-            jax.ShapeDtypeStruct((n[1] * NDIM,), jnp.float64),
-            jax.ShapeDtypeStruct((n[0],), jnp.float64),
-            jax.ShapeDtypeStruct((n[1],), jnp.float64),
-            jax.ShapeDtypeStruct((1,), jnp.float64),
-            jax.ShapeDtypeStruct((_bufsize(meshsize, n, nbins, mu_entries),),
-                                 jnp.float64),
+            jax.ShapeDtypeStruct((n[0] * NDIM,), sample_dtype),
+            jax.ShapeDtypeStruct((n[1] * NDIM,), sample_dtype),
+            jax.ShapeDtypeStruct((n[0],), sample_dtype),
+            jax.ShapeDtypeStruct((n[1],), sample_dtype),
+            jax.ShapeDtypeStruct((1,), sample_dtype),
+            jax.ShapeDtypeStruct(
+                (_scratch(sample_width, _bufsize(meshsize, n, nbins, mu_entries)),),
+                sample_dtype),
         )
-        vjp = jax.ffi.ffi_call('count2_soft_vjp' + suffix, outputs)
+        vjp = jax.ffi.ffi_call(ffi_names[1] + suffix, outputs)
         gpos1, gpos2, gw1, gw2, _gsigma, _buf = vjp(*ops, cotangent.reshape((slots,)))
         grads = []
         for p, hw, gpos, gw in zip(particles, has_weights, (gpos1, gpos2), (gw1, gw2)):

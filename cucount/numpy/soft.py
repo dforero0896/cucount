@@ -272,6 +272,7 @@ def soft_weights(s, edges, sigma=None):
 
 def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
                 soft_cutoff: float=1e-13, soft_taps: str='exact',
+                soft_accum: str='float32',
                 soft_mu_sigma: float=None, soft_mu_bins: int=0,
                 soft_mu_edges=None,
                 wattrs: WeightAttrs=None,
@@ -303,6 +304,14 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
         Only affects the general (non-uniform) path. ``'exact'`` (default) uses
         double ``exp``; ``'fast'`` uses ``__expf``, trading ~1e-6 relative
         accuracy in the weights for roughly half the transcendental cost.
+    soft_accum : {'float32', 'float64'}
+        Precision of the shared-memory per-block histograms. ``'float32'``
+        (default) is 1.5-3x faster than ``'float64'`` on Ampere and later,
+        because ``atomicAdd(double*)`` in shared memory is a CAS retry loop;
+        the tap math, the window search and the pair selection stay double, so
+        the only cost is rounding when each block adds its partial sum to the
+        output histogram (a few 1e-7 relative). Use ``'float64'`` to recover the
+        previous bit-comparable path, e.g. for conservation tests at 1e-15.
     soft_mu_sigma : float, optional
         Width of the mu kernel, in mu units, for a request whose second axis is
         ``pole=(ells, los)``. ``None`` (or 0) means half a mu bin. The mu axis is
@@ -330,7 +339,8 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
         ``{'weight': array(nbins)}``, or ``array(nbins, nell)`` for soft
         multipoles, plus ``result['soft']`` describing what ran
         (``sigma`` after the default, ``sigma_kind`` = 'absolute' or 'width',
-        ``uniform``, ``fast_taps``, ``cutoff``, ``kmax``, ``taps`` (``-1`` when
+        ``uniform``, ``fast_taps``, ``accum`` = 'float32' or 'float64',
+        ``cutoff``, ``kmax``, ``taps`` (``-1`` when
         the window is adaptive), ``path`` = 'shared' or 'global', ``nbins``,
         and for multipoles ``multipoles``, ``mu_sigma``, ``mu_bins``,
         ``mu_kmax``, ``los``, ``mu_uniform``, ``mu_sigma_kind``, ``mu_taps``
@@ -367,7 +377,7 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
             *cparticles, mattrs._to_c(), battrs,
             wattrs=wattrs._to_c(), sattrs=sattrs, spattrs=spattrs,
             soft_sigma=soft_sigma, soft_cutoff=float(soft_cutoff),
-            soft_taps=str(soft_taps),
+            soft_taps=str(soft_taps), soft_accum=str(soft_accum),
             soft_mu_sigma=soft_mu_sigma, soft_mu_bins=int(soft_mu_bins),
             soft_mu_edges=soft_mu_edges,
             nthreads=lib_nthreads, return_timings=True)
@@ -379,7 +389,8 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
 
 def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
                     soft_sigma: float=None, soft_cutoff: float=1e-13,
-                    soft_taps: str='exact', soft_mu_sigma: float=None,
+                    soft_taps: str='exact', soft_accum: str='float32',
+                    soft_mu_sigma: float=None,
                     soft_mu_bins: int=0, soft_mu_edges=None,
                     wattrs: WeightAttrs=None, sattrs: SelectionAttrs=None,
                     spattrs: SplitAttrs=None, mattrs: MeshAttrs=None,
@@ -464,7 +475,7 @@ def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
             *cparticles, mattrs._to_c(), battrs, cotangent,
             wattrs=wattrs._to_c(), sattrs=sattrs, spattrs=spattrs,
             soft_sigma=soft_sigma, soft_cutoff=float(soft_cutoff),
-            soft_taps=str(soft_taps),
+            soft_taps=str(soft_taps), soft_accum=str(soft_accum),
             soft_mu_sigma=soft_mu_sigma, soft_mu_bins=int(soft_mu_bins),
             soft_mu_edges=soft_mu_edges,
             nthreads=lib_nthreads, return_timings=True)

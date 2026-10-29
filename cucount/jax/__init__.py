@@ -74,7 +74,8 @@ _FFI_BACKENDS = {'cuda': (ffi_cudalib, 'CUDA'), 'cpu': (ffi_cpulib, 'cpu')}
 # Soft binning is an extension: its targets exist in the CUDA module only, so a
 # backend that does not export one is simply skipped here, keeping
 # `import cucount.jax` working for every build.
-for _name in ('count2', 'count3', 'count3close', 'count2_soft', 'count2_soft_vjp'):
+for _name in ('count2', 'count3', 'count3close', 'count2_soft', 'count2_soft_vjp',
+              'count2_soft_f32', 'count2_soft_vjp_f32'):
     for _mode, (_module, _platform) in _FFI_BACKENDS.items():
         if _module is None:
             continue

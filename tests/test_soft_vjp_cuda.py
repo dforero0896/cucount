@@ -19,6 +19,14 @@ import pytest
 from cucount.numpy import BinAttrs, MeshAttrs, Particles, cudalib
 from cucount.numpy import count2_soft, count2_soft_vjp
 
+# The reference tests below check the softmax math, the window and the adjoint
+# against exact references, so they pin the exact accumulator. The default
+# float32 shared-memory tile costs a few 1e-7 relative on the counts (see
+# test_soft_s_cuda.py::test_float32_accumulation_is_the_default); at 1e-12
+# tolerances that rounding, not the model, is what a failure would measure.
+ACC = 'float64'
+
+
 needs_cuda = pytest.mark.skipif(
     cudalib is None or cudalib.device_count() == 0,
     reason='CUDA extension not built, or no GPU visible')
@@ -42,14 +50,14 @@ def _setup(n=120, seed=3):
 def _loss(pos, w, ba, g, sigma=SIGMA):
     p = Particles(pos, w)
     ma = MeshAttrs(p, p, boxsize=BOX, battrs=ba, periodic=True)
-    counts = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=sigma)['weight']
+    counts = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=sigma, soft_accum=ACC)['weight']
     return float(np.dot(g, counts))
 
 
 def _vjp(pos, w, ba, g, sigma=SIGMA):
     p = Particles(pos, w)
     ma = MeshAttrs(p, p, boxsize=BOX, battrs=ba, periodic=True)
-    out = count2_soft_vjp(p, p, battrs=ba, cotangent=g, mattrs=ma, soft_sigma=sigma)
+    out = count2_soft_vjp(p, p, battrs=ba, cotangent=g, mattrs=ma, soft_sigma=sigma, soft_accum=ACC)
     gpos = np.asarray(out['grad_position1']) + np.asarray(out['grad_position2'])
     gw = np.asarray(out['grad_weight1']) + np.asarray(out['grad_weight2'])
     return gpos, gw, float(out['grad_sigma']), out
@@ -118,7 +126,7 @@ def test_cotangent_length_is_validated():
     pos, w, ba, ma = _setup(n=50)
     with pytest.raises(Exception, match='cotangent'):
         count2_soft_vjp(Particles(pos, w), Particles(pos, w), battrs=ba,
-                        cotangent=np.zeros(EDGES.size), mattrs=ma)
+                        cotangent=np.zeros(EDGES.size), mattrs=ma, soft_accum=ACC)
 
 
 def test_weight_gradients_absent_without_individual_weights():
@@ -126,7 +134,7 @@ def test_weight_gradients_absent_without_individual_weights():
     g = np.ones(EDGES.size - 1)
     p = Particles(pos)
     ma = MeshAttrs(p, p, boxsize=BOX, battrs=ba, periodic=True)
-    out = count2_soft_vjp(p, p, battrs=ba, cotangent=g, mattrs=ma)
+    out = count2_soft_vjp(p, p, battrs=ba, cotangent=g, mattrs=ma, soft_accum=ACC)
     assert out['grad_weight1'] is None
     assert out['grad_weight2'] is None
     assert np.asarray(out['grad_position1']).shape == (pos.shape[0], 3)
@@ -150,7 +158,7 @@ def test_non_uniform_grid_gradients_match_finite_difference():
     def vjp(pp, ww):
         p = Particles(pp, ww)
         ma = MeshAttrs(p, p, boxsize=BOX, battrs=ba, periodic=True)
-        out = count2_soft_vjp(p, p, battrs=ba, cotangent=g, mattrs=ma)
+        out = count2_soft_vjp(p, p, battrs=ba, cotangent=g, mattrs=ma, soft_accum=ACC)
         return (np.asarray(out['grad_position1']) + np.asarray(out['grad_position2']),
                 np.asarray(out['grad_weight1']) + np.asarray(out['grad_weight2']),
                 float(out['grad_sigma']))
@@ -191,7 +199,7 @@ def test_non_uniform_adjoint_fast_taps_tracks_exact():
     def run(kw):
         p = Particles(pos, w)
         ma = MeshAttrs(p, p, boxsize=BOX, battrs=ba, periodic=True)
-        out = count2_soft_vjp(p, p, battrs=ba, cotangent=g, mattrs=ma, soft_sigma=None, **kw)
+        out = count2_soft_vjp(p, p, battrs=ba, cotangent=g, mattrs=ma, soft_sigma=None, **kw, soft_accum=ACC)
         return np.asarray(out['grad_position1']), np.asarray(out['grad_weight1'])
 
     gpos_e, gw_e = run({})

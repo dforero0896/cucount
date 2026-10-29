@@ -45,8 +45,12 @@ DEFINE_FOR_EACH_CANDIDATE
 // A scatter target is either the shared block tile (atomic) or a thread-private
 // row of it, in which case no other thread can touch the slot and a plain add is
 // both correct and far cheaper.
-template <bool ATOMIC>
-__device__ __forceinline__ void soft_increment(FLOAT *p, FLOAT v)
+// ACC is the accumulator type of the scatter target: `float` by default (a
+// shared-memory atomicAdd(double*) has no native atom.add.f64 on Ampere, so
+// ptxas emits a CAS retry loop -- see SOFT_BINNING_PLAN.md section 23), `double`
+// when the caller asks for bit-comparable results.
+template <typename ACC, bool ATOMIC>
+__device__ __forceinline__ void soft_increment(ACC *p, ACC v)
 {
     if constexpr (ATOMIC) {
         atomicAdd(p, v);
@@ -60,9 +64,9 @@ __device__ __forceinline__ void soft_increment(FLOAT *p, FLOAT v)
 // `stride` is the histogram stride between neighbouring s bins: 1 for a plain
 // soft-s request, nell when the multipoles are folded into `hist` (see
 // soft_add_pole below, which calls this once per multipole on hist + ill).
-template <bool ATOMIC>
+template <typename ACC, bool ATOMIC>
 __device__ __forceinline__ void soft_add_uniform(
-    FLOAT *hist,
+    ACC *hist,
     const SoftBinSpec &sp,
     FLOAT s,
     FLOAT w,
@@ -119,7 +123,7 @@ __device__ __forceinline__ void soft_add_uniform(
         }
 
         const FLOAT scale = w / sum;
-        soft_increment<ATOMIC>(&hist[m * stride], scale);
+        soft_increment<ACC, ATOMIC>(&hist[m * stride], scale);
 
         wu = 1; ru = rup;
         wd = 1; rd = rdn;
@@ -129,8 +133,8 @@ __device__ __forceinline__ void soft_add_uniform(
             ru *= sp.iq;
             wd *= rd;
             rd *= sp.iq;
-            soft_increment<ATOMIC>(&hist[(m + t) * stride], wu * scale);
-            soft_increment<ATOMIC>(&hist[(m - t) * stride], wd * scale);
+            soft_increment<ACC, ATOMIC>(&hist[(m + t) * stride], wu * scale);
+            soft_increment<ACC, ATOMIC>(&hist[(m - t) * stride], wd * scale);
         }
 
         return;
@@ -163,7 +167,7 @@ __device__ __forceinline__ void soft_add_uniform(
     // float division of a double: keep it double, the histogram is double.
     const FLOAT scale = w / sum;
 
-    soft_increment<ATOMIC>(&hist[m * stride], scale);
+    soft_increment<ACC, ATOMIC>(&hist[m * stride], scale);
 
     wu = 1; ru = rup;
     wd = 1; rd = rdn;
@@ -178,10 +182,10 @@ __device__ __forceinline__ void soft_add_uniform(
         okd = (m - t >= 0) && (wd > sp.cutoff);
 
         if (oku) {
-            soft_increment<ATOMIC>(&hist[(m + t) * stride], wu * scale);
+            soft_increment<ACC, ATOMIC>(&hist[(m + t) * stride], wu * scale);
         }
         if (okd) {
-            soft_increment<ATOMIC>(&hist[(m - t) * stride], wd * scale);
+            soft_increment<ACC, ATOMIC>(&hist[(m - t) * stride], wd * scale);
         }
         if (!oku && !okd) {
             break;
@@ -302,9 +306,9 @@ __device__ __forceinline__ SoftWindow soft_general_window(
 }
 
 
-template <bool ATOMIC>
+template <typename ACC, bool ATOMIC>
 __device__ __forceinline__ void soft_add_general(
-    FLOAT *hist,
+    ACC *hist,
     const SoftBinSpec &sp,
     FLOAT s,
     FLOAT w,
@@ -337,18 +341,18 @@ __device__ __forceinline__ void soft_add_general(
     // recurrence to replay; soft_taps='fast' is the knob that makes it cheap.
     const FLOAT scale = w / sum;
 
-    soft_increment<ATOMIC>(&hist[m * stride], scale);
+    soft_increment<ACC, ATOMIC>(&hist[m * stride], scale);
 
     for (int k = 1; k <= win.up; ++k) {
         const FLOAT dd = s - cen[m + k];
-        soft_increment<ATOMIC>(
+        soft_increment<ACC, ATOMIC>(
             &hist[(m + k) * stride],
             scale * soft_tap_weight(dd * dd * i2s2[m + k] - win.lmin, fast));
     }
 
     for (int k = 1; k <= win.dn; ++k) {
         const FLOAT dd = s - cen[m - k];
-        soft_increment<ATOMIC>(
+        soft_increment<ACC, ATOMIC>(
             &hist[(m - k) * stride],
             scale * soft_tap_weight(dd * dd * i2s2[m - k] - win.lmin, fast));
     }
@@ -357,19 +361,19 @@ __device__ __forceinline__ void soft_add_general(
 
 // The one entry the op calls: one predictable branch per pair picks the path,
 // so the uniform kernel keeps its instruction stream and register count.
-template <bool ATOMIC>
+template <typename ACC, bool ATOMIC>
 __device__ __forceinline__ void soft_add(
-    FLOAT *hist,
+    ACC *hist,
     const SoftBinSpec &sp,
     FLOAT s,
     FLOAT w,
     const int stride)
 {
     if (sp.uniform) {
-        soft_add_uniform<ATOMIC>(hist, sp, s, w, stride);
+        soft_add_uniform<ACC, ATOMIC>(hist, sp, s, w, stride);
     }
     else {
-        soft_add_general<ATOMIC>(hist, sp, s, w, stride);
+        soft_add_general<ACC, ATOMIC>(hist, sp, s, w, stride);
     }
 }
 
@@ -650,9 +654,9 @@ __device__ __forceinline__ void soft_mu_profile(
 // window is walked once per multipole (the sum that normalises it does not
 // depend on l), so the extra work over a plain soft-s pair is nell - 1 window
 // walks, and the atomics are exactly taps_s * nell either way.
-template <bool ATOMIC>
+template <typename ACC, bool ATOMIC>
 __device__ __forceinline__ void soft_add_pole(
-    FLOAT *hist,
+    ACC *hist,
     const SoftBinSpec &sp,
     FLOAT s,
     FLOAT mu,
@@ -667,7 +671,7 @@ __device__ __forceinline__ void soft_add_pole(
     soft_mu_profile<false>(sp, mu, M, M);
 
     for (int ill = 0; ill < sp.nell; ++ill) {
-        soft_add<ATOMIC>(hist + ill, sp, s, w * M[ill], sp.nell);
+        soft_add<ACC, ATOMIC>(hist + ill, sp, s, w * M[ill], sp.nell);
     }
 }
 
@@ -676,9 +680,9 @@ __device__ __forceinline__ void soft_add_pole(
 // Pair counting op
 // ============================================================================
 
-template <bool ATOMIC>
+template <typename ACC, bool ATOMIC>
 struct Count2SoftOp {
-    FLOAT *hist;
+    ACC *hist;
 
     FLOAT *position1;
     FLOAT *sposition1;
@@ -754,10 +758,10 @@ struct Count2SoftOp {
             compute_pair_mu(diff, sposition1, sposition2, position1, position2,
                             spec.los, s, s * s, true, &mu, &mu2);
 
-            soft_add_pole<ATOMIC>(hist, spec, s, mu, pair_weight);
+            soft_add_pole<ACC, ATOMIC>(hist, spec, s, mu, pair_weight);
         }
         else {
-            soft_add<ATOMIC>(hist, spec, s, pair_weight, 1);
+            soft_add<ACC, ATOMIC>(hist, spec, s, pair_weight, 1);
         }
     }
 };
@@ -790,7 +794,7 @@ struct Count2SoftOp {
 // per pair" and "soft costs one geometry pass plus a few shared stores".
 #define CUCOUNT_SOFT_MAXWARP 32
 
-template <MESH_TYPE TARGET_MESH_TYPE, int REP>
+template <MESH_TYPE TARGET_MESH_TYPE, int REP, typename ACC>
 __global__ void count2_soft_kernel(
     FLOAT *counts,
     Mesh mesh1,
@@ -800,7 +804,11 @@ __global__ void count2_soft_kernel(
     WeightAttrs wattrs,
     SoftBinSpec spec)
 {
-    extern __shared__ FLOAT tile[];
+    // Declared as bytes and cast: the tile is float or double depending on ACC,
+    // and two differently typed extern __shared__ arrays do not mix. The base
+    // of dynamic shared memory is 16-byte aligned, which covers both.
+    extern __shared__ char soft_smem[];
+    ACC *tile = reinterpret_cast<ACC *>(soft_smem);
 
     constexpr bool ATOMIC = (REP != 32);
     // Histogram entries, i.e. s bins times multipoles: the tile, the row stride
@@ -817,7 +825,9 @@ __global__ void count2_soft_kernel(
         __syncthreads();
     }
 
-    FLOAT *hist = counts;
+    // REP == 0 has no tile: it scatters straight into the caller's float64
+    // histogram, which is why that instantiation is only used with ACC == FLOAT.
+    ACC *hist = reinterpret_cast<ACC *>(counts);
 
     if constexpr (REP > 0) {
         // Row per lane when REP == 32, otherwise lane % REP lanes share a row.
@@ -834,7 +844,7 @@ __global__ void count2_soft_kernel(
         FLOAT *sposition1 = &(mesh1.spositions[NDIM * ii]);
         FLOAT *value1     = &(mesh1.values[mesh1.index_value.size * ii]);
 
-        Count2SoftOp<ATOMIC> op{
+        Count2SoftOp<ACC, ATOMIC> op{
             hist,
             position1,
             sposition1,
@@ -859,14 +869,16 @@ __global__ void count2_soft_kernel(
         __syncthreads();
 
         for (int i = threadIdx.x; i < nbins; i += blockDim.x) {
-            FLOAT acc = 0;
+            // Reduce the private rows in the accumulator's precision, then add
+            // the block total once into the caller's float64 histogram.
+            ACC acc = 0;
 
             for (int r = 0; r < nrows; ++r) {
                 acc += tile[r * nbins + i];
             }
 
             if (acc != 0) {
-                atomicAdd(&counts[i], acc);
+                atomicAdd(&counts[i], (FLOAT) acc);
             }
         }
     }
@@ -877,7 +889,86 @@ __global__ void count2_soft_kernel(
 // Host entry point
 // ============================================================================
 
-template <MESH_TYPE TARGET_MESH_TYPE, int REP>
+template <MESH_TYPE TARGET_MESH_TYPE, int REP, typename ACC>
+static void launch_soft(
+    FLOAT *counts,
+    const Mesh *list_mesh,
+    const MeshAttrs &mattrs,
+    const SelectionAttrs &sattrs,
+    const WeightAttrs &wattrs,
+    const SoftBinSpec &spec,
+    int nblocks,
+    int nthreads_per_block,
+    size_t shmem,
+    cudaStream_t stream);
+
+// One instantiation chain per accumulator type: the REP switch is the same for
+// both, so it lives here instead of being duplicated inside count2_soft.
+template <typename ACC>
+static void dispatch_soft(
+    FLOAT *counts,
+    const Mesh *list_mesh,
+    const MeshAttrs &mattrs,
+    const SelectionAttrs &sattrs,
+    const WeightAttrs &wattrs,
+    const SoftBinSpec &spec,
+    int rep,
+    int nblocks,
+    int nthreads_per_block,
+    size_t shmem,
+    cudaStream_t stream)
+{
+#define CUCOUNT_LAUNCH_SOFT(MESH, REPV)                                     \
+    launch_soft<MESH, REPV, ACC>(                                           \
+        counts, list_mesh, mattrs, sattrs, wattrs, spec,                    \
+        nblocks, nthreads_per_block, shmem, stream)
+
+    if (mattrs.type == MESH_ANGULAR) {
+        if (rep == 32) {
+            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 32);
+        }
+        else if (rep == 8) {
+            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 8);
+        }
+        else if (rep == 4) {
+            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 4);
+        }
+        else if (rep == 2) {
+            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 2);
+        }
+        else if (rep == 1) {
+            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 1);
+        }
+        else {
+            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 0);
+        }
+    }
+    else {
+        if (rep == 32) {
+            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 32);
+        }
+        else if (rep == 8) {
+            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 8);
+        }
+        else if (rep == 4) {
+            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 4);
+        }
+        else if (rep == 2) {
+            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 2);
+        }
+        else if (rep == 1) {
+            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 1);
+        }
+        else {
+            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 0);
+        }
+    }
+
+#undef CUCOUNT_LAUNCH_SOFT
+}
+
+
+template <MESH_TYPE TARGET_MESH_TYPE, int REP, typename ACC>
 static void launch_soft(
     FLOAT *counts,
     const Mesh *list_mesh,
@@ -890,7 +981,7 @@ static void launch_soft(
     size_t shmem,
     cudaStream_t stream)
 {
-    count2_soft_kernel<TARGET_MESH_TYPE, REP><<<
+    count2_soft_kernel<TARGET_MESH_TYPE, REP, ACC><<<
         nblocks,
         nthreads_per_block,
         shmem,
@@ -913,7 +1004,8 @@ static void launch_soft(
 // 8x to 32x while four or more blocks stay resident.
 static const size_t soft_tile_budget = 12288;
 
-static int pick_rep(const SoftBinSpec &spec, int nthreads_per_block, size_t budget)
+static int pick_rep(const SoftBinSpec &spec, int nthreads_per_block, size_t budget,
+                    size_t acc_size)
 {
     const int nwarps = nthreads_per_block / CUCOUNT_SOFT_MAXWARP;
 
@@ -922,7 +1014,7 @@ static int pick_rep(const SoftBinSpec &spec, int nthreads_per_block, size_t budg
     }
 
     for (int rep : {8, 4, 2, 1}) {
-        const size_t bytes = (size_t) nwarps * rep * spec.nslots * sizeof(FLOAT);
+        const size_t bytes = (size_t) nwarps * rep * (size_t) spec.nslots * acc_size;
 
         if (bytes <= budget) {
             return rep;
@@ -1070,15 +1162,17 @@ void count2_soft(
     int nblocks, nthreads_per_block;
 
     if (mattrs.type == MESH_ANGULAR) {
+        // The occupancy query only needs a representative instantiation: the
+        // register footprint is set by the pair loop, not by the tile type.
         CONFIGURE_KERNEL_LAUNCH(
-            (count2_soft_kernel<MESH_ANGULAR, 1>),
+            (count2_soft_kernel<MESH_ANGULAR, 1, FLOAT>),
             nblocks,
             nthreads_per_block,
             buffer);
     }
     else {
         CONFIGURE_KERNEL_LAUNCH(
-            (count2_soft_kernel<MESH_CARTESIAN, 1>),
+            (count2_soft_kernel<MESH_CARTESIAN, 1, FLOAT>),
             nblocks,
             nthreads_per_block,
             buffer);
@@ -1087,7 +1181,11 @@ void count2_soft(
     int dev = 0;
     cudaGetDevice(&dev);
 
-    int rep = pick_rep(spec, nthreads_per_block, soft_tile_budget);
+    // Bytes per tile entry: the accumulator is narrow by default (see
+    // SoftBinSpec::acc_float).
+    const size_t tile_size = spec.acc_float ? sizeof(float) : sizeof(FLOAT);
+
+    int rep = pick_rep(spec, nthreads_per_block, soft_tile_budget, tile_size);
 
     // Bench hooks: the winning number of copies is machine dependent, so allow
     // an override and report what was used instead of guessing silently.
@@ -1105,7 +1203,7 @@ void count2_soft(
         int fits = 0;
 
         for (int cand : {16, 8, 4, 2, 1}) {
-            if (cand <= rep && (size_t) nwarps * cand * csize * sizeof(FLOAT) <= (size_t) max_shmem) {
+            if (cand <= rep && (size_t) nwarps * cand * csize * tile_size <= (size_t) max_shmem) {
                 fits = cand;
                 break;
             }
@@ -1116,59 +1214,25 @@ void count2_soft(
 
     spec.path = rep;  // reported back to the caller: 0 = global, else private copies
     const size_t shmem = rep > 0
-        ? (size_t) nwarps * rep * csize * sizeof(FLOAT)
+        ? (size_t) nwarps * rep * csize * tile_size
         : 0;
 
     // No device-wide synchronisation and no event timing here: the python caller
     // times itself around a stream sync, and the jax FFI path runs inside a
     // stream XLA owns, where blocking the device is not allowed.
-#define CUCOUNT_LAUNCH_SOFT(MESH, REPV)                                     \
-    launch_soft<MESH, REPV>(                                                \
-        counts, list_mesh, mattrs, sattrs, wattrs, spec,                    \
-        nblocks, nthreads_per_block, shmem, stream)
-
-    if (mattrs.type == MESH_ANGULAR) {
-        if (rep == 32) {
-            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 32);
-        }
-        else if (rep == 8) {
-            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 8);
-        }
-        else if (rep == 4) {
-            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 4);
-        }
-        else if (rep == 2) {
-            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 2);
-        }
-        else if (rep == 1) {
-            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 1);
-        }
-        else {
-            CUCOUNT_LAUNCH_SOFT(MESH_ANGULAR, 0);
-        }
+    // The accumulator width only changes the scatter target. REP == 0 (no tile
+    // fits) writes into the caller's float64 histogram, so that path always runs
+    // with the wide accumulator.
+    if (spec.acc_float && rep > 0) {
+        dispatch_soft<float>(
+            counts, list_mesh, mattrs, sattrs, wattrs, spec, rep,
+            nblocks, nthreads_per_block, shmem, stream);
     }
     else {
-        if (rep == 32) {
-            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 32);
-        }
-        else if (rep == 8) {
-            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 8);
-        }
-        else if (rep == 4) {
-            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 4);
-        }
-        else if (rep == 2) {
-            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 2);
-        }
-        else if (rep == 1) {
-            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 1);
-        }
-        else {
-            CUCOUNT_LAUNCH_SOFT(MESH_CARTESIAN, 0);
-        }
+        dispatch_soft<FLOAT>(
+            counts, list_mesh, mattrs, sattrs, wattrs, spec, rep,
+            nblocks, nthreads_per_block, shmem, stream);
     }
-
-#undef CUCOUNT_LAUNCH_SOFT
 
     // Peek, do not consume: the caller's stream sync (pybind) or the FFI
     // handler's cudaGetLastError() must still see the failure. Reading it here
@@ -1181,6 +1245,62 @@ void count2_soft(
     }
 
     release_soft_tables(spec, buffer);
+}
+
+
+// ============================================================================
+// Narrow-storage boundary
+// ============================================================================
+
+// Grid-stride copies, not cudaMemcpy: the element types differ. They run on the
+// caller's stream so the ordering against set_mesh and the kernels is the same
+// as everything else on this path.
+static __global__ void soft_cast_f32_to_f64_kernel(FLOAT *dst, const float *src,
+                                                   size_t n)
+{
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (size_t) gridDim.x * blockDim.x) {
+        dst[i] = (FLOAT) src[i];
+    }
+}
+
+static __global__ void soft_cast_f64_to_f32_kernel(float *dst, const FLOAT *src,
+                                                   size_t n)
+{
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (size_t) gridDim.x * blockDim.x) {
+        dst[i] = (float) src[i];
+    }
+}
+
+static void soft_cast_blocks(size_t n, int *nblocks, int *nthreads)
+{
+    *nthreads = 256;
+    *nblocks = (int) std::min<size_t>((n + *nthreads - 1) / *nthreads, 65535);
+}
+
+void soft_cast_f32_to_f64(FLOAT *dst, const float *src, size_t n,
+                          cudaStream_t stream)
+{
+    if (n == 0) {
+        return;
+    }
+
+    int nblocks, nthreads;
+    soft_cast_blocks(n, &nblocks, &nthreads);
+    soft_cast_f32_to_f64_kernel<<<nblocks, nthreads, 0, stream>>>(dst, src, n);
+}
+
+void soft_cast_f64_to_f32(float *dst, const FLOAT *src, size_t n,
+                          cudaStream_t stream)
+{
+    if (n == 0) {
+        return;
+    }
+
+    int nblocks, nthreads;
+    soft_cast_blocks(n, &nblocks, &nthreads);
+    soft_cast_f64_to_f32_kernel<<<nblocks, nthreads, 0, stream>>>(dst, src, n);
 }
 
 
