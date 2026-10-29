@@ -238,3 +238,104 @@ def test_hard_and_soft_wrappers_agree_in_the_narrow_sigma_limit():
                        soft_sigma=1e-3)['weight']
     got, want = _counts(soft), _counts(hard)
     np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-10 * np.abs(want).max())
+
+
+def _jax_catalogue(edges, ells=None, n=24, seed=3):
+    """JAX particles, numpy binning and a concrete JAX mesh.
+
+    ``MeshAttrs`` cannot infer the box from traced positions, so the mesh is
+    built from concrete arrays and passed in explicitly -- the same constraint
+    the raw jax frontend has.
+    """
+    from cucount.jax import BinAttrs as JBinAttrs, MeshAttrs as JMeshAttrs
+
+    rng = np.random.default_rng(seed)
+    pos = rng.uniform(0.0, BOX, (n, 3))
+    w = rng.uniform(0.5, 1.5, n)
+    nbattrs = BinAttrs(s=edges) if ells is None else BinAttrs(s=edges, pole=(ells, 'z'))
+    jbattrs = JBinAttrs(s=edges) if ells is None else JBinAttrs(s=edges, pole=(ells, 'z'))
+    mattrs = JMeshAttrs(pos, battrs=jbattrs, periodic=True, boxsize=BOX)
+    return pos, w, nbattrs, jbattrs, mattrs
+
+
+def _flat_counts(observable):
+    """Counts of a Count2, or the poles stacked on the last axis (possibly traced)."""
+    if isinstance(observable, Count2Poles):
+        import jax.numpy as jnp
+        return jnp.stack([pole.values('counts') for pole in observable], axis=-1)
+    return observable.values('counts')
+
+
+@needs_cuda
+def test_wrapper_is_jax_traceable():
+    """The lsstypes wrapper must not convert traced arrays with numpy.
+
+    ``np.ones_like`` (used to broadcast the normalization) calls ``__array__``
+    and used to raise ``TracerArrayConversionError`` inside ``jax.jit``. The
+    lsstypes containers are not pytrees, so a jit-ed function returns the counts
+    array; that is the pattern exercised here and documented in the README.
+    """
+    jax = pytest.importorskip('jax')
+    jax.config.update('jax_enable_x64', True)
+    from cucount.jax import Particles as JParticles
+
+    edges = np.linspace(5.0, 60.0, 12)
+
+    # the hard wrapper shares the fixed helper
+    pos, w, nbattrs, jbattrs, mattrs = _jax_catalogue(edges)
+    hard = lambda pp, ww: _flat_counts(count2(JParticles(pp, ww), battrs=jbattrs, mattrs=mattrs)['weight'])
+    eager_hard = np.asarray(hard(pos, w))
+    jitted_hard = np.asarray(jax.jit(hard)(pos, w))
+    np.testing.assert_allclose(jitted_hard, eager_hard, rtol=1e-12)
+
+    for ells in (None, [0, 2]):
+        pos, w, nbattrs, jbattrs, mattrs = _jax_catalogue(edges, ells)
+        kw = {} if ells is None else dict(soft_mu_sigma=0.05)
+
+        def soft(pp, ww, jbattrs=jbattrs, mattrs=mattrs, kw=kw):
+            return _flat_counts(count2_soft(JParticles(pp, ww), battrs=jbattrs, mattrs=mattrs,
+                                            **kw)['weight'])
+
+        eager = np.asarray(soft(pos, w))
+        jitted = np.asarray(jax.jit(soft)(pos, w))
+        np.testing.assert_allclose(jitted, eager, rtol=1e-12)
+        # and against the numpy frontend, whose self pairs are removed identically
+        p_np = Particles(np.asarray(pos), np.asarray(w))
+        ref = np.asarray(_counts(count2_soft(p_np, battrs=nbattrs,
+                                             mattrs=_mattrs(p_np, p_np, nbattrs), **kw)['weight']))
+        np.testing.assert_allclose(jitted, ref, rtol=1e-11)
+
+
+@needs_cuda
+def test_gradients_flow_through_the_wrapper():
+    """``jax.jit(jax.grad(...))`` through the wrapper must hit the CUDA adjoint.
+
+    ``L = sum(cos(counts))`` hands the analytic adjoint the cotangent
+    ``-sin(counts)``. An autocorrelation passes the same catalogue twice, so its
+    two legs are summed, exactly as JAX does for the two operands.
+    """
+    jax = pytest.importorskip('jax')
+    jax.config.update('jax_enable_x64', True)
+    from cucount.jax import Particles as JParticles
+
+    edges = np.linspace(5.0, 60.0, 12)
+
+    for ells in (None, [0, 2]):
+        pos, w, nbattrs, jbattrs, mattrs = _jax_catalogue(edges, ells)
+        kw = {} if ells is None else dict(soft_mu_sigma=0.05)
+
+        def soft(pp, ww, jbattrs=jbattrs, mattrs=mattrs, kw=kw):
+            return _flat_counts(count2_soft(JParticles(pp, ww), battrs=jbattrs, mattrs=mattrs,
+                                            **kw)['weight'])
+
+        loss = lambda pp, ww: jax.numpy.sum(jax.numpy.cos(soft(pp, ww)))
+        g_pos, g_weight = (np.asarray(g) for g in jax.jit(jax.grad(loss, argnums=(0, 1)))(pos, w))
+
+        p_np = Particles(np.asarray(pos), np.asarray(w))
+        ref = nsoft.count2_soft_vjp(p_np, p_np, battrs=nbattrs,
+                                    mattrs=_mattrs(p_np, p_np, nbattrs),
+                                    cotangent=-np.sin(np.asarray(soft(pos, w))), **kw)
+        for got, want in ((g_pos, ref['grad_position1'] + ref['grad_position2']),
+                          (g_weight, ref['grad_weight1'] + ref['grad_weight2'])):
+            scale = max(float(np.max(np.abs(want))), 1e-30)
+            np.testing.assert_allclose(got, want, rtol=1e-11, atol=1e-12 * scale)

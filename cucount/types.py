@@ -11,6 +11,16 @@ from cucount.numpy import Particles, BinAttrs, WeightAttrs, MeshAttrs, symmetriz
 prod = partial(functools.reduce, operator.mul)
 
 
+def _ones_like(x):
+    """``np.ones_like`` that does not convert a traced JAX array to numpy.
+
+    ``np.ones_like`` calls ``__array__`` on its argument, which raises
+    ``TracerArrayConversionError`` inside ``jax.jit``. Only the shape and dtype
+    are needed here, and both are static even for a tracer.
+    """
+    return np.ones(np.shape(x), dtype=getattr(x, 'dtype', None))
+
+
 def _use_jax(particles):
     try:
         from cucount.jax import Particles
@@ -34,7 +44,7 @@ def _get_coords_edges(battrs, suffix=''):
 def _count2_to_lsstypes(counts: np.ndarray, norm: np.ndarray, battrs=None, attrs: dict=None):
     import lsstypes as types
     coords, edges, ells = _get_coords_edges(battrs)
-    norm = norm * np.ones_like(counts)
+    norm = norm * _ones_like(counts)
     kw = dict(**coords, **edges, coords=list(coords), attrs=attrs or {})
     if ells:
         poles = [types.Count2Pole(counts=counts[..., ill], norm=norm[..., ill], **kw, ell=ell) for ill, ell in enumerate(ells)]
@@ -270,6 +280,15 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
     result : dict of Count2 or Count2Poles
         Pair counts in :mod:`lsstypes` format, with the soft configuration in
         ``attrs`` (``soft_sigma``, ``soft_cutoff``, ``soft_multipoles``, ...).
+
+    Notes
+    -----
+    JAX-traceable: nothing in here converts the counts with numpy, so
+    ``jax.jit`` / ``jax.grad`` / ``jax.value_and_grad`` compose with it and the
+    gradient runs through the analytic CUDA adjoint. The lsstypes containers are
+    not pytrees, so a jit-ed function must return arrays -- ``.values('counts')``,
+    stacking the poles of a ``Count2Poles``. Pass ``mattrs`` explicitly (as for
+    :func:`count2`): the mesh cannot be inferred from traced positions.
     """
     if wattrs is None: wattrs = WeightAttrs()
     autocorr = len(particles) == 1
@@ -313,7 +332,11 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
         if key == 'soft':
             continue
         if autocorr:
-            counts = counts - wattrs(*(particles[:1] * 2)).sum() * zero
+            offset = wattrs(*(particles[:1] * 2)).sum() * zero
+            if hasattr(counts, 'dtype'):
+                # static, but keep float32 jit-ed counts from being promoted
+                offset = offset.astype(counts.dtype)
+            counts = counts - offset
         result[key] = _count2_to_lsstypes(counts=counts, norm=norm_value, battrs=battrs, attrs=attrs)
     return result
 
@@ -355,10 +378,10 @@ def _count3_to_lsstypes(counts: np.ndarray, norm: np.ndarray, battrs12=None, bat
     if ells12 and ells13:
         counts, ells = symmetrize_poles(counts, ells12, ells13)
         # broadcast the (scalar) norm only AFTER symmetrisation: symmetrize_poles replaces the pole axis
-        norm = norm * np.ones_like(counts)
+        norm = norm * _ones_like(counts)
         poles = [types.Count3Pole(counts=counts[..., ill], norm=norm[..., ill], **kw, ell=ell) for ill, ell in enumerate(ells)]
         return types.Count3Poles(poles)
-    norm = norm * np.ones_like(counts)
+    norm = norm * _ones_like(counts)
     return types.Count3(counts=counts, norm=norm, **kw)
 
 
