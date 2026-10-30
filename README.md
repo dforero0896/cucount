@@ -399,10 +399,27 @@ per-block shared-memory histogram: `'float32'` (the default) is faster because A
 `atomicAdd(double*)` is a compare-and-swap loop, and costs a few `1e-7` relative on the
 counts; `'float64'` restores the bit-comparable path for conservation tests.
 
-The soft kernel is CUDA-only and rejects spin, angular upweights and split/jackknife
-requests instead of silently ignoring them. Runnable examples:
-`examples/soft_counts_lsstypes.py` (this frontend, isotropic and multipoles),
-`examples/soft_hist_grad_jax.py` (gradients through `cucount.jax.soft`).
+Soft binning runs on both backends. `backend='cuda'` scatters into per-block shared-memory
+histograms; `backend='cpu'` scatters into one `float64` histogram per thread and reduces
+them at the end, so the CPU kernel has no `soft_accum`/`soft_taps` occupancy trade-off --- it
+accumulates exactly, and reports `soft['path'] == 'threads'` with `soft['accum'] ==
+'float64'`. Both backends resolve the request through the same shared header
+(`include/soft.h`), so the window, the per-bin sigmas and the caller's mu cells cannot
+drift between them; only the per-pair scatter and the adjoint are written twice. The CPU
+adjoint is the same analytic one (positions, individual weights and `soft_sigma`), so
+`count2_soft(...)['weight']` stays differentiable on a machine without a GPU.
+
+On CPU the soft count costs about 4.7x the hard one per core, and 2.4x at the best wall time
+achievable (the soft kernel keeps scaling one thread doubling longer). Quote those numbers
+only with the thread count pinned: `backend='cpu'` defaults to the *affinity mask*, so a
+timing taken on a login node is an oversubscription measurement.
+
+JAX soft counts (`cucount.jax.soft`) are still CUDA-only: the CPU has no FFI handler for the
+soft kernel yet and raises `NotImplementedError` rather than falling back silently.
+Both backends reject spin, angular upweights and split/jackknife requests instead of
+silently ignoring them. Runnable examples: `examples/soft_counts_lsstypes.py` (this
+frontend, isotropic and multipoles), `examples/soft_hist_grad_jax.py` (gradients through
+`cucount.jax.soft`).
 
 ---
 

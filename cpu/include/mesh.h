@@ -148,6 +148,10 @@ struct ScalarMesh {
     std::vector<double> spositions;  // 3 per particle, on the unit sphere
     std::vector<double> values;      // vsize per particle
     std::vector<size_t> start;       // ncells + 1 offsets
+    // Slot -> input particle, filled only on request (build_mesh's
+    // keep_original_index): the adjoint accumulates per *input* particle, and
+    // the mesh reorders by cell. Empty elsewhere, so the hard paths pay nothing.
+    std::vector<size_t> origin;
     size_t vsize = 0;
     size_t total = 0;
     IndexValue iv = {};
@@ -194,8 +198,11 @@ inline size_t mesh_ncells(const MeshAttrs& mattrs) {
     return n;
 }
 
-// Counting pass then fill, mirroring set_mesh.
-inline ScalarMesh build_mesh(const Particles& p, const MeshAttrs& mattrs) {
+// Counting pass then fill, mirroring set_mesh. `keep_original_index` fills
+// ScalarMesh::origin (slot -> input particle) for the soft adjoint, which needs
+// to write per input particle rather than per cell-ordered slot.
+inline ScalarMesh build_mesh(const Particles& p, const MeshAttrs& mattrs,
+                             const bool keep_original_index = false) {
     ScalarMesh m;
     m.iv = p.index_value;
     m.vsize = p.index_value.size;
@@ -228,6 +235,7 @@ inline ScalarMesh build_mesh(const Particles& p, const MeshAttrs& mattrs) {
     m.positions.resize(3 * m.total);
     m.spositions.resize(3 * m.total);
     m.values.resize(m.vsize * m.total);
+    if (keep_original_index) m.origin.resize(m.total);
 
     std::vector<size_t> fill(m.start.begin(), m.start.end() - 1);
     for (size_t i = 0; i < n; i++) {
@@ -237,6 +245,7 @@ inline ScalarMesh build_mesh(const Particles& p, const MeshAttrs& mattrs) {
             m.positions[3 * o + axis] = p.positions[NDIM * i + axis];
             m.spositions[3 * o + axis] = spos[3 * i + axis];
         }
+        if (keep_original_index) m.origin[o] = i;
         for (size_t iv = 0; iv < m.vsize; iv++)
             m.values[m.vsize * o + iv] = p.values[m.vsize * i + iv];
     }

@@ -7,9 +7,10 @@ sigma -> 0 limit, and the invariants (weight conservation, monotone cutoff
 truncation) are checked directly so a wrong kernel cannot pass by agreeing with
 another wrong one.
 
-Requests are made with backend='cuda' explicitly: soft binning is CUDA-only in
-v1, and a request for another backend must raise rather than silently fall back
-to hard binning.
+Requests are made with backend='cuda' explicitly so that these tests exercise
+the GPU kernel whichever backend the default resolution would pick; the CPU
+kernel has its own module (tests/test_soft_cpu.py), and the two are cross-checked
+there rather than silently falling back to hard binning here.
 """
 
 import numpy as np
@@ -259,10 +260,24 @@ def test_rejects_bad_cutoff():
 
 
 @needs_cuda
-def test_rejects_non_cuda_backend():
+def test_cpu_backend_is_served_and_agrees_with_cuda():
+    # Soft binning used to be CUDA-only. Now both backends resolve the request
+    # in the same include/soft.h and only the scatter/adjoint are written twice,
+    # so the two histograms must agree up to the per-block rounding of the CUDA
+    # accumulation (float64 here).
     p, ba, ma = _setup()
-    with pytest.raises(NotImplementedError, match='CUDA-only'):
-        count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu', soft_accum=ACC)
+    cu = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC)['weight']
+    cp = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu', soft_accum=ACC)['weight']
+    assert cp.shape == cu.shape
+    np.testing.assert_allclose(cp, cu, rtol=1e-13, atol=1e-13 * cu.max())
+    assert cp.sum() == pytest.approx(cu.sum(), rel=1e-13)
+
+
+@needs_cuda
+def test_rejects_an_unknown_backend():
+    p, ba, ma = _setup()
+    with pytest.raises(ValueError, match='backend must be one of'):
+        count2_soft(p, p, battrs=ba, mattrs=ma, backend='opencl', soft_accum=ACC)
 
 
 def test_soft_weights_is_a_normalised_softmax():

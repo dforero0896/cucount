@@ -277,8 +277,9 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
         mu is not folded) instead of the internal uniform grid.
     **kwargs
         Selection, split, mesh and backend arguments, forwarded to the count
-        function. The soft kernel is CUDA-only for now and rejects
-        spin/angular/split requests rather than ignoring them.
+        function. Both backends serve soft binning (they share the request
+        resolution); both reject spin/angular/split requests rather than
+        ignoring them.
 
     Returns
     -------
