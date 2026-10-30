@@ -1036,69 +1036,34 @@ static int pick_rep(const SoftBinSpec &spec, int nthreads_per_block, size_t budg
 static void upload_soft_tables(SoftBinSpec &spec, DeviceMemoryBuffer *buffer,
                                cudaStream_t stream)
 {
-    if (!spec.uniform) {
-        const size_t n = (size_t) spec.nbins;
-        FLOAT *d_centres = (FLOAT *) my_device_malloc(n * sizeof(FLOAT), buffer);
-        FLOAT *d_inv2s2 = (FLOAT *) my_device_malloc(n * sizeof(FLOAT), buffer);
-        FLOAT *d_edges = (FLOAT *) my_device_malloc((n + 1) * sizeof(FLOAT), buffer);
-        std::vector<FLOAT> h_centres(n), h_inv2s2(n);
+    // The tables themselves are derived by the shared host helper (include/soft.h)
+    // so the CPU and the CUDA backend cannot disagree about the centres, the
+    // per-bin sigma or the edges of a caller-supplied grid; all this function owns
+    // is the device copies and their lifetime.
+    std::vector<FLOAT> s_centres, s_inv2s2, s_edges;
+    std::vector<FLOAT> mu_centres, mu_inv2s2, mu_edges;
 
-        for (size_t i = 0; i < n; ++i) {
-            const double e0 = (double) spec.host_edges[i];
-            const double e1 = (double) spec.host_edges[i + 1];
-            // sigma_i proportional to the local width unless the caller asked for
-            // one absolute sigma. Both land in the same array, so the kernel has a
-            // single code path.
-            const double sigma = spec.per_bin_sigma
-                ? (double) spec.alpha * (e1 - e0)
-                : (double) spec.sigma;
+    soft_build_host_tables(spec, s_centres, s_inv2s2, s_edges,
+                           mu_centres, mu_inv2s2, mu_edges);
 
-            h_centres[i] = (FLOAT) (0.5 * (e0 + e1));
-            h_inv2s2[i] = (FLOAT) (1. / (2. * sigma * sigma));
-        }
-
-        CUDA_CHECK(cudaMemcpyAsync(d_centres, h_centres.data(), n * sizeof(FLOAT),
+    auto upload = [&](const std::vector<FLOAT> &h) -> FLOAT * {
+        FLOAT *d = (FLOAT *) my_device_malloc(h.size() * sizeof(FLOAT), buffer);
+        CUDA_CHECK(cudaMemcpyAsync(d, h.data(), h.size() * sizeof(FLOAT),
                                    cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_inv2s2, h_inv2s2.data(), n * sizeof(FLOAT),
-                                   cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_edges, spec.host_edges, (n + 1) * sizeof(FLOAT),
-                                   cudaMemcpyHostToDevice, stream));
+        return d;
+    };
 
-        spec.centres = d_centres;
-        spec.inv2s2 = d_inv2s2;
-        spec.edges = d_edges;
+    if (!s_centres.empty()) {
+        // (The host pointers the helper installed are replaced by device ones.)
+        spec.centres = upload(s_centres);
+        spec.inv2s2 = upload(s_inv2s2);
+        spec.edges = upload(s_edges);
     }
 
-    // The mu grid needs the same treatment when it is not arithmetic: centres,
-    // per-cell 1/(2 sigma_j^2) and the edges the window search walks.
-    if (spec.nell > 0 && !spec.mu_uniform) {
-        const size_t n = (size_t) spec.nmu;
-        FLOAT *d_centres = (FLOAT *) my_device_malloc(n * sizeof(FLOAT), buffer);
-        FLOAT *d_inv2s2 = (FLOAT *) my_device_malloc(n * sizeof(FLOAT), buffer);
-        FLOAT *d_edges = (FLOAT *) my_device_malloc((n + 1) * sizeof(FLOAT), buffer);
-        std::vector<FLOAT> h_centres(n), h_inv2s2(n);
-
-        for (size_t i = 0; i < n; ++i) {
-            const double e0 = (double) spec.host_mu_edges[i];
-            const double e1 = (double) spec.host_mu_edges[i + 1];
-            const double sigma = spec.mu_per_bin_sigma
-                ? (double) spec.mu_alpha * (e1 - e0)
-                : (double) spec.mu_sigma;
-
-            h_centres[i] = (FLOAT) (0.5 * (e0 + e1));
-            h_inv2s2[i] = (FLOAT) (1. / (2. * sigma * sigma));
-        }
-
-        CUDA_CHECK(cudaMemcpyAsync(d_centres, h_centres.data(), n * sizeof(FLOAT),
-                                   cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_inv2s2, h_inv2s2.data(), n * sizeof(FLOAT),
-                                   cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_edges, spec.host_mu_edges, (n + 1) * sizeof(FLOAT),
-                                   cudaMemcpyHostToDevice, stream));
-
-        spec.mu_centres = d_centres;
-        spec.mu_inv2s2 = d_inv2s2;
-        spec.mu_edge_table = d_edges;
+    if (!mu_centres.empty()) {
+        spec.mu_centres = upload(mu_centres);
+        spec.mu_inv2s2 = upload(mu_inv2s2);
+        spec.mu_edge_table = upload(mu_edges);
     }
 }
 

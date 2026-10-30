@@ -12,7 +12,9 @@ the comparison a user actually cares about:
   the quadrupole/hexadecapole come out differentiable instead of piecewise
   constant.
 
-Run it on a GPU node (the soft kernel is CUDA-only)::
+The counts above run on either backend (``CUCOUNT_BACKEND=cpu`` forces the CPU
+kernel); the jit/gradient panel needs a GPU, because ``cucount.jax.soft`` is
+CUDA-only for now::
 
     python examples/soft_counts_lsstypes.py
 

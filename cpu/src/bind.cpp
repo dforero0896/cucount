@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -12,6 +13,7 @@
 // convenience macros on its way out; attrs.h's own include of common.h then
 // restores them for the rest of this translation unit.
 #include "count2.h"
+#include "count2_soft.h"
 #include "count3close.h"
 
 // The shared attrs/layout/args layer (CUDA-free flavour): the binding takes
@@ -511,6 +513,294 @@ py::object count3close_py(Particles_py& particles1, Particles_py& particles2,
     return std::move(result);
 }
 
+// ---------------------------------------------------------------------------
+// Soft binning
+// ---------------------------------------------------------------------------
+//
+// Same signature and same result dict as the CUDA soft binding, so the numpy
+// frontend can dispatch on `mode` alone. The differences are honest reporting:
+// there is no shared-memory tile on the CPU, so `accum` is 'float64' (the
+// accumulator is plain double -- `soft_accum='float32'` is a GPU occupancy
+// trade, with nothing to buy here) and `path` is 'threads', one private
+// histogram per thread reduced at the end.
+
+// The soft metadata dict. Deliberately the same keys as the CUDA binding's
+// soft_meta(); it is duplicated rather than shared because it is pybind-shaped,
+// and a test compares the two key sets and values on the same request.
+py::dict soft_meta(const SoftBinSpec &spec)
+{
+    py::dict soft;
+
+    // A width-scaled sigma (non-arithmetic grid, sigma <= 0) is reported as the
+    // multiplier of the local bin width, which is what actually ran; the
+    // absolute branch covers an arithmetic grid or an explicit sigma.
+    soft["sigma"] = spec.per_bin_sigma ? spec.alpha
+                    : (spec.inv2sig2 > 0 ? 1. / std::sqrt(2. * spec.inv2sig2) : 0.);
+    soft["sigma_units"] = "separation";
+    soft["sigma_kind"] = spec.per_bin_sigma ? "width" : "absolute";
+    soft["uniform"] = spec.uniform != 0;
+    soft["fast_taps"] = spec.fast_taps != 0;
+    soft["accum"] = "float64";  // the accumulator is double, always
+    soft["cutoff"] = spec.cutoff;
+    soft["kmax"] = spec.kmax;
+    // Only the uniform path has a fixed window length; the general path expands
+    // until the cutoff stops it, so its tap count depends on the pair.
+    soft["taps"] = spec.uniform ? 2 * spec.kmax + 1 : -1;
+    soft["path"] = "threads";
+    soft["copies"] = 0;
+    soft["nbins"] = spec.nbins;
+
+    // Multipoles: the ells that were summed over, and the mu quadrature that
+    // carried them. Empty/zero for a plain soft-s request.
+    py::list ells;
+
+    for (int i = 0; i < spec.nell; ++i) {
+        ells.append(spec.ells[i]);
+    }
+
+    soft["multipoles"] = ells;
+    soft["mu_sigma"] = spec.nell > 0 ? (double) spec.mu_sigma : 0.;
+    soft["mu_bins"] = spec.nmu;
+    soft["mu_kmax"] = spec.nell > 0 ? spec.mu_kmax : 0;
+    soft["los"] = spec.nell > 0 ? los_type_to_string(spec.los) : std::string("");
+    soft["mu_uniform"] = spec.mu_uniform != 0;
+    soft["mu_sigma_kind"] = spec.mu_per_bin_sigma ? "width" : "absolute";
+    soft["mu_taps"] = spec.mu_uniform ? 2 * spec.mu_kmax + 1 : -1;
+
+    if (spec.nell > 0 && !spec.mu_uniform && spec.host_mu_edges) {
+        py::list mu_edges;
+
+        for (int i = 0; i <= spec.nmu; ++i) {
+            mu_edges.append((double) spec.host_mu_edges[i]);
+        }
+
+        soft["mu_edges"] = mu_edges;
+    }
+
+    return soft;
+}
+
+
+// Host copy of the optional caller-supplied mu edges. The spec points into this
+// vector, so it must outlive the count; it does, because both entries build the
+// spec and run the count in the same scope.
+std::vector<double> soft_mu_edges_from_py(const py::object &obj)
+{
+    std::vector<double> edges;
+
+    if (obj.is_none()) {
+        return edges;
+    }
+
+    Arr arr = py::cast<Arr>(obj);
+    edges.assign(arr.data(), arr.data() + arr.size());
+    return edges;
+}
+
+
+// Shared by the forward and the adjoint: the checks and the spec, so the two
+// cannot disagree about what they are differentiating.
+SoftBinSpec soft_spec_from_py(const BinAttrs &battrs, const WeightAttrs &wattrs,
+                             const SplitAttrs &spattrs, const MeshAttrs &mattrs,
+                             const py::object &sigma_obj, double cutoff,
+                             const std::string &taps, const py::object &mu_sigma_obj,
+                             int mu_bins, const std::vector<double> &mu_edges,
+                             size_t *csize)
+{
+    // The soft kernels soften the separation measured through a cartesian mesh;
+    // the angular mesh is a hard-path feature.
+    if (mattrs.type != MESH_CARTESIAN)
+        throw std::invalid_argument(
+            "cpu backend, soft binning: only cartesian meshes are served");
+
+    if (taps != "exact" && taps != "fast")
+        throw std::invalid_argument(
+            "cpu backend, soft binning: soft_taps must be one of 'exact', 'fast'");
+
+    const double sigma = sigma_obj.is_none() ? 0. : py::cast<double>(sigma_obj);
+    const double mu_sigma = mu_sigma_obj.is_none() ? 0. : py::cast<double>(mu_sigma_obj);
+
+    return make_soft_bin_spec(battrs, wattrs, spattrs, sigma, cutoff, csize, mu_sigma,
+                              mu_bins, mu_edges.empty() ? nullptr : mu_edges.data(),
+                              static_cast<int>(mu_edges.size()),
+                              /*acc_float=*/0, /*backend=*/"cpu");
+}
+
+
+py::object count2_soft_py(Particles_py& particles1, Particles_py& particles2,
+                          MeshAttrs_py mattrs_py, BinAttrs_py battrs_py,
+                          WeightAttrs_py wattrs_py,
+                          const SelectionAttrs_py sattrs_py,
+                          const SplitAttrs_py spattrs_py,
+                          const py::object& soft_sigma_obj,
+                          const double soft_cutoff,
+                          const std::string& soft_taps,
+                          const std::string& soft_accum,
+                          const py::object& soft_mu_sigma_obj,
+                          const int soft_mu_bins,
+                          const py::object& soft_mu_edges_obj,
+                          const int nthreads, const bool return_timings) {
+    const BinAttrs& battrs = battrs_py.data();
+    const MeshAttrs& mattrs = mattrs_py.data();
+    const WeightAttrs& wattrs = wattrs_py.data();
+    const SelectionAttrs& sattrs = sattrs_py.data();
+    const SplitAttrs& spattrs = spattrs_py.data();
+
+    validate(particles1.data(), particles2.data(), battrs, mattrs, wattrs, sattrs,
+             spattrs);
+
+    // Accepted for signature parity with the CUDA binding; on the CPU the
+    // accumulator is double either way and `result['soft']['accum']` says so.
+    if (soft_accum != "float32" && soft_accum != "float64")
+        throw std::invalid_argument(
+            "cpu backend, soft binning: soft_accum must be one of 'float32', 'float64'");
+
+    const std::vector<double> mu_edges = soft_mu_edges_from_py(soft_mu_edges_obj);
+    size_t csize = 0;
+    SoftBinSpec spec = soft_spec_from_py(battrs, wattrs, spattrs, mattrs, soft_sigma_obj,
+                                        soft_cutoff, soft_taps, soft_mu_sigma_obj,
+                                        soft_mu_bins, mu_edges, &csize);
+
+    Particles p1 = particles1.data();
+    Particles p2 = particles2.data();
+
+    py::array_t<double> counts_py(csize);
+    std::memset(counts_py.mutable_data(), 0, csize * sizeof(double));
+
+    double timings[2] = {0.0, 0.0};
+
+    {
+        Count2SoftArgs a;
+        a.p1 = p1;
+        a.p2 = p2;
+        a.attrs.mattrs = mattrs;
+        a.attrs.battrs = battrs;
+        a.attrs.wattrs = wattrs;
+        a.attrs.sattrs = sattrs;
+        a.attrs.spattrs = spattrs;
+        a.spec = &spec;
+        a.out = counts_py.mutable_data();
+        a.nthreads = nthreads;
+        a.timings = return_timings ? timings : nullptr;
+
+        py::gil_scoped_release unlock;
+        Count2Soft(a);
+    }
+
+    // Same named-channel shape as the CUDA soft result: (nbins, nell) with the
+    // multipoles, (nbins,) without; the slots are s-major either way.
+    py::object weight = spec.nell > 0
+        ? counts_py.attr("reshape")(py::make_tuple(spec.nbins, spec.nell))
+        : counts_py.attr("reshape")(py::make_tuple(spec.nbins));
+
+    py::dict result;
+    result["weight"] = weight;
+    result["soft"] = soft_meta(spec);
+
+    if (return_timings) {
+        return py::make_tuple(result, py::make_tuple(timings[0], timings[1]));
+    }
+
+    return std::move(result);
+}
+
+
+py::object count2_soft_vjp_py(Particles_py& particles1, Particles_py& particles2,
+                              MeshAttrs_py mattrs_py, BinAttrs_py battrs_py,
+                              const py::object& cotangent_obj,
+                              WeightAttrs_py wattrs_py,
+                              const SelectionAttrs_py sattrs_py,
+                              const SplitAttrs_py spattrs_py,
+                              const py::object& soft_sigma_obj,
+                              const double soft_cutoff,
+                              const std::string& soft_taps,
+                              const std::string& soft_accum,
+                              const py::object& soft_mu_sigma_obj,
+                              const int soft_mu_bins,
+                              const py::object& soft_mu_edges_obj,
+                              const int nthreads, const bool return_timings) {
+    const BinAttrs& battrs = battrs_py.data();
+    const MeshAttrs& mattrs = mattrs_py.data();
+    const WeightAttrs& wattrs = wattrs_py.data();
+    const SelectionAttrs& sattrs = sattrs_py.data();
+    const SplitAttrs& spattrs = spattrs_py.data();
+
+    validate(particles1.data(), particles2.data(), battrs, mattrs, wattrs, sattrs,
+             spattrs);
+
+    if (soft_accum != "float32" && soft_accum != "float64")
+        throw std::invalid_argument(
+            "cpu backend, soft binning: soft_accum must be one of 'float32', 'float64'");
+
+    const std::vector<double> mu_edges = soft_mu_edges_from_py(soft_mu_edges_obj);
+    size_t csize = 0;
+    SoftBinSpec spec = soft_spec_from_py(battrs, wattrs, spattrs, mattrs, soft_sigma_obj,
+                                        soft_cutoff, soft_taps, soft_mu_sigma_obj,
+                                        soft_mu_bins, mu_edges, &csize);
+
+    Particles p1 = particles1.data();
+    Particles p2 = particles2.data();
+    const size_t n1 = p1.size;
+    const size_t n2 = p2.size;
+
+    Arr cotangent = py::cast<Arr>(cotangent_obj);
+
+    if (cotangent.size() != static_cast<py::ssize_t>(csize))
+        throw std::invalid_argument(
+            "the cotangent must have one entry per histogram slot (N), got " +
+            std::to_string(cotangent.size()) + " for " + std::to_string(csize) +
+            " slots");
+
+    py::array_t<double> gpos1(3 * n1);
+    py::array_t<double> gpos2(3 * n2);
+    const bool have_w1 = p1.index_value.size_individual_weight != 0;
+    const bool have_w2 = p2.index_value.size_individual_weight != 0;
+    py::array_t<double> gw1(have_w1 ? n1 : 0);
+    py::array_t<double> gw2(have_w2 ? n2 : 0);
+    py::array_t<double> gsigma(1);
+
+    double timings[2] = {0.0, 0.0};
+
+    {
+        Count2SoftVjpArgs a;
+        a.p1 = p1;
+        a.p2 = p2;
+        a.attrs.mattrs = mattrs;
+        a.attrs.battrs = battrs;
+        a.attrs.wattrs = wattrs;
+        a.attrs.sattrs = sattrs;
+        a.attrs.spattrs = spattrs;
+        a.spec = &spec;
+        a.cotangent = cotangent.data();
+        a.grad_position1 = gpos1.mutable_data();
+        a.grad_position2 = gpos2.mutable_data();
+        a.grad_weight1 = have_w1 ? gw1.mutable_data() : nullptr;
+        a.grad_weight2 = have_w2 ? gw2.mutable_data() : nullptr;
+        a.grad_sigma = gsigma.mutable_data();
+        a.nthreads = nthreads;
+        a.timings = return_timings ? timings : nullptr;
+
+        py::gil_scoped_release unlock;
+        Count2SoftVjp(a);
+    }
+
+    py::dict result;
+    result["grad_position1"] =
+        gpos1.attr("reshape")(py::make_tuple(n1, 3)).cast<py::array_t<double>>();
+    result["grad_position2"] =
+        gpos2.attr("reshape")(py::make_tuple(n2, 3)).cast<py::array_t<double>>();
+    result["grad_weight1"] = have_w1 ? py::object(gw1) : py::object(py::none());
+    result["grad_weight2"] = have_w2 ? py::object(gw2) : py::object(py::none());
+    result["grad_sigma"] = gsigma.data()[0];
+    result["soft"] = soft_meta(spec);
+
+    if (return_timings) {
+        return py::make_tuple(result, py::make_tuple(timings[0], timings[1]));
+    }
+
+    return std::move(result);
+}
+
 }  // namespace
 
 // The kernel touches no Python objects and releases the GIL, so the module
@@ -537,6 +827,46 @@ PYBIND11_MODULE(cpu, m, py::mod_gil_not_used()) {
           "output as cucountlib.cucount.count2; nthreads means CPU threads.\n"
           "Every ordered pair is visited, matching the CUDA backend, so an\n"
           "autocorrelation counts each pair twice and includes self-pairs.");
+
+    m.def("count2_soft", &count2_soft_py,
+          py::arg("particles1"), py::arg("particles2"),
+          py::arg("mattrs"), py::arg("battrs"),
+          py::arg("wattrs") = WeightAttrs_py(),
+          py::arg("sattrs") = SelectionAttrs_py(),
+          py::arg("spattrs") = SplitAttrs_py(),
+          py::arg("soft_sigma") = py::none(),
+          py::arg("soft_cutoff") = 1e-13,
+          py::arg("soft_taps") = "exact",
+          py::arg("soft_accum") = "float32",
+          py::arg("soft_mu_sigma") = py::none(),
+          py::arg("soft_mu_bins") = 0,
+          py::arg("soft_mu_edges") = py::none(),
+          py::arg("nthreads") = 1,
+          py::arg("return_timings") = false,
+          "Pair counts with Gaussian-softmax soft binning on the separation\n"
+          "axis, same signature and result dict as cucountlib.cuda.count2_soft.\n"
+          "Every pair is visited once per thread-private histogram and the\n"
+          "histograms are reduced at the end, so the accumulator is double:\n"
+          "soft_accum is accepted for parity and reported as 'float64'.");
+
+    m.def("count2_soft_vjp", &count2_soft_vjp_py,
+          py::arg("particles1"), py::arg("particles2"),
+          py::arg("mattrs"), py::arg("battrs"), py::arg("cotangent"),
+          py::arg("wattrs") = WeightAttrs_py(),
+          py::arg("sattrs") = SelectionAttrs_py(),
+          py::arg("spattrs") = SplitAttrs_py(),
+          py::arg("soft_sigma") = py::none(),
+          py::arg("soft_cutoff") = 1e-13,
+          py::arg("soft_taps") = "exact",
+          py::arg("soft_accum") = "float32",
+          py::arg("soft_mu_sigma") = py::none(),
+          py::arg("soft_mu_bins") = 0,
+          py::arg("soft_mu_edges") = py::none(),
+          py::arg("nthreads") = 1,
+          py::arg("return_timings") = false,
+          "Vector-Jacobian product of the CPU count2_soft: gradients with\n"
+          "respect to the two catalogues' positions, individual weights and\n"
+          "soft_sigma; same output keys as cucountlib.cuda.count2_soft_vjp.");
 
     m.def("count3", &count3_py,
           py::arg("particles1"), py::arg("particles2"), py::arg("particles3"),

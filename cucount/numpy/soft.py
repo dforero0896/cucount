@@ -41,8 +41,9 @@ exactly, so the monopole is the soft-s count.
 Differences from the oracle, both because the kernel is new rather than a port:
 
 * the ``pi`` axis is not softened (soft ``s`` and ``mu`` are);
-* the kernel is a CUDA kernel with a shared-memory histogram tile, not the
-  oracle's scalar CPU loop;
+* the CUDA kernel scatters through a shared-memory histogram tile rather than
+  the oracle's scalar loop, and the CPU kernel visits every pair once per
+  OpenMP thread into a thread-private histogram (double, reduced at the end);
 * weights outside ``soft_cutoff`` of the peak are dropped and the window is
   renormalised, as the oracle does. Its default cutoff is 1e-13, which is what
   makes the tap count (and so the cost) ~9 taps per pair at the default sigma.
@@ -329,9 +330,10 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
         covers part of the interval leaves the pairs beyond it to the boundary
         cell.
     wattrs, sattrs, spattrs, mattrs, nthreads, backend, tuning
-        As for :func:`cucount.numpy.count2`; the soft kernel is CUDA-only for
-        now, and rejects spin, angular upweighting, split/jackknife and any
-        second binning axis rather than quietly ignoring them.
+        As for :func:`cucount.numpy.count2`. Both backends serve soft binning;
+        both reject spin, angular upweighting, split/jackknife and any second
+        binning axis other than ``pole`` rather than quietly ignoring them.
+        ``nthreads`` (through ``tuning``) is GPUs on CUDA and threads on the CPU.
 
     Returns
     -------
@@ -368,10 +370,6 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
     cparticles = [_to_c_particles(p) for p in particles]
 
     def run(which, tuning):
-        if which != 'cuda':
-            raise NotImplementedError(
-                'soft binning is CUDA-only for now; the hard cpu backend is '
-                'unchanged and count2() still serves it')
         lib, lib_nthreads = _lib_and_nthreads(which, tuning)
         result, timings = lib.count2_soft(
             *cparticles, mattrs._to_c(), battrs,
@@ -466,10 +464,6 @@ def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
     cotangent = np.ascontiguousarray(cotangent, dtype=np.float64)
 
     def run(which, tuning):
-        if which != 'cuda':
-            raise NotImplementedError(
-                'soft binning is CUDA-only for now; the hard cpu backend is '
-                'unchanged and count2() still serves it')
         lib, lib_nthreads = _lib_and_nthreads(which, tuning)
         result, timings = lib.count2_soft_vjp(
             *cparticles, mattrs._to_c(), battrs, cotangent,

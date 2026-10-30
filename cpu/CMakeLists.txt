@@ -62,7 +62,11 @@ find_package(pybind11 CONFIG REQUIRED)
 # src/generic.cpp is the scalar path for everything the Highway kernel does
 # not vectorise; it is a plain translation unit, compiled once, so nothing it
 # adds can reach the kernel's inner loop.
-add_library(cucount_cpu_kernels OBJECT src/count2.cpp src/generic.cpp src/count3.cpp src/count3close.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/logger.cpp)
+# src/count2_soft.cpp is the soft (Gaussian-softmax) pair count and its adjoint;
+# like generic.cpp it is a scalar translation unit, so it cannot slow the
+# Highway kernel down. Its request resolution lives in ../include/soft.h, shared
+# with the CUDA soft kernel.
+add_library(cucount_cpu_kernels OBJECT src/count2.cpp src/generic.cpp src/count2_soft.cpp src/count3.cpp src/count3close.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/logger.cpp)
 # ../include for cmath.h, the scalar per-pair math shared with CUDA (the
 # other headers there are CUDA-only and are not included from this target).
 target_include_directories(cucount_cpu_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../include)
