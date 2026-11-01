@@ -342,8 +342,9 @@ automatically.
 ### 🌫️ Soft binning
 
 `count2` places every pair in exactly one bin. `count2_soft` shares it between
-neighbouring bins with a Gaussian softmax around each bin centre instead: counts move
-between bins but total weight is conserved, and `soft_sigma -> 0` recovers `count2`.
+neighbouring bins with a Gaussian softmax around each bin centre instead: the
+weights of every counted pair sum to one over the real and buffer centres, and
+`soft_sigma -> 0` recovers `count2`.
 It returns the same `Count2` / `Count2Poles` containers, and `attrs` records the soft
 configuration (`soft_sigma`, `soft_cutoff`, `soft_multipoles`, ...).
 
@@ -383,7 +384,23 @@ differentiable --- gradients need the soft kernel.
 `soft_sigma` defaults to half a bin: on a non-uniform grid it is half of *each* bin, so
 `attrs['soft_sigma']` is the multiplier of the local width (`soft_sigma_kind='width'`),
 while on an arithmetic grid it is an absolute width (`'absolute'`). Pass a number for a
-constant width in separation units. `soft_cutoff` drops the Gaussian tail (the window is renormalized, so weight stays
+constant width in separation units.
+
+`soft_pad` controls the edge truncation. The kernel spreads each pair with a Gaussian
+of infinite support, but only traverses pairs inside `[s_edges[0], s_edges[-1])`, so the
+outermost bins average a *half* kernel: the last bin comes out biased high (and the
+first low), and the bias grows with the steepness of the correlation function and the
+kernel width. `soft_pad=z` extends the counting range by `z` kernel widths with
+**buffer bins** (geometric continuation on a log grid, arithmetic otherwise), lets the
+softmax normalise over the real and buffer centres, and drops the buffer bins from the
+result. `None` selects the pyfcfc default `z=2`; `soft_pad=0` restores the previous
+estimator bit for bit. In a periodic box the extended maximum edge is clamped below
+`L/2` (the minimum-image limit), and the lower edge never goes below zero. The buffer
+bins make the traversal enumerate the extra pairs in those shells --- roughly
+`exp(3 z f) - 1` more at the upper edge for log bins --- and `attrs` records the layout
+as `soft_pad`, `soft_pad_lo`, `soft_pad_hi` and `soft_nbins_padded`.
+
+`soft_cutoff` drops the Gaussian tail (the window is renormalized, so weight stays
 conserved) and `soft_taps='fast'` trades ~1e-6 weight accuracy for speed on non-uniform
 grids. For multipoles the mu quadrature is a uniform grid over the full `[-1, 1]` (mu is
 not folded, so odd multipoles keep their sign): `soft_mu_bins` sets its resolution and
@@ -398,6 +415,23 @@ arithmetic stays `float64`). Independently, `soft_accum` selects the precision o
 per-block shared-memory histogram: `'float32'` (the default) is faster because Ampere's
 `atomicAdd(double*)` is a compare-and-swap loop, and costs a few `1e-7` relative on the
 counts; `'float64'` restores the bit-comparable path for conservation tests.
+
+A float32 sample dtype does not weaken the adjoint: the kernel computes it in `float64`
+and narrows only the returned gradient, and the float32 test compares it against the
+`float64` adjoint to `5e-5`. Two things *can* make a fit look frozen even though the
+gradient is correct. First, the weighting: `xi = counts / norm` carries a
+`1/norm ~ 1/N^2` factor, so the gradient of a normalized-xi loss is `~1/N^2` of the raw
+counts gradient. A power-spectrum loss has no such factor, so in a joint objective the
+P(k) term can dominate the update by four or five orders of magnitude: P(k) trains and
+moves the particles while the xi term never gets a comparable step. Fit counts instead
+(multiply the xi cotangent by `norm`), or otherwise weight the two terms to comparable
+gradient scale; rescaling the whole loss does not change the relative weight. Second,
+the update precision: even when xi is the only term, a tiny gradient added to a float32
+position near the box size can round back to the same bits, and a default Adam `eps`
+can dominate a `~1e-9` gradient. Try `JAX_ENABLE_X64=1` (float64 positions), a smaller
+Adam `eps`, or the counts loss above. `examples/soft_grad_training.py` reproduces the
+joint P(k)/xi case with both position precisions and shows the counts-loss fix;
+`examples/soft_grad_precision.py` measures the float32 ulp threshold.
 
 Soft binning runs on both backends. `backend='cuda'` scatters into per-block shared-memory
 histograms; `backend='cpu'` scatters into one `float64` histogram per thread and reduces
@@ -419,7 +453,11 @@ soft kernel yet and raises `NotImplementedError` rather than falling back silent
 Both backends reject spin, angular upweights and split/jackknife requests instead of
 silently ignoring them. Runnable examples: `examples/soft_counts_lsstypes.py` (this
 frontend, isotropic and multipoles), `examples/soft_hist_grad_jax.py` (gradients through
-`cucount.jax.soft`).
+`cucount.jax.soft`), `examples/soft_pad_leakage.py` (unpadded vs padded soft counts
+against hard binning at the last edge), `examples/soft_grad_training.py` (why a joint
+P(k)+xi loss can leave xi untrained, and how fitting counts fixes it) and
+`examples/soft_grad_precision.py` (why a normalized xi gradient can be too small for a
+float32 position update).
 
 ---
 

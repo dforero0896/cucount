@@ -18,8 +18,21 @@ import pytest
 
 from cucount.numpy import (BinAttrs, MeshAttrs, Particles, SelectionAttrs,
                            SplitAttrs, WeightAttrs, cpulib)
-from cucount.numpy import count2, count2_soft, count2_soft_vjp
+from cucount.numpy import count2, count2_soft as _count2_soft, count2_soft_vjp as _count2_soft_vjp
 from cucount.numpy.soft import mu_spec, soft_mu_weights, soft_weights
+
+
+# This module pins the unpadded estimator: its O(N^2) references and its
+# conservation checks describe the softmax over the real bins only.  Edge
+# padding is exercised in test_soft_pad.py.
+def count2_soft(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return _count2_soft(*args, **kwargs)
+
+
+def count2_soft_vjp(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return _count2_soft_vjp(*args, **kwargs)
 
 needs_cpu = pytest.mark.skipif(cpulib is None, reason='CPU extension not built')
 
@@ -175,6 +188,46 @@ def test_adjoint_matches_finite_differences():
 
     fd_s = (loss(pos, w, sigma + eps) - loss(pos, w, sigma - eps)) / (2 * eps)
     assert got['grad_sigma'] == pytest.approx(fd_s, rel=2e-5)
+
+
+@needs_cpu
+def test_small_separation_adjoint_matches_finite_differences():
+    """The adjoint must survive the 1/s factor at the smallest separations.
+
+    Real correlation-function fits put their constraining power in the first few
+    bins, where the separation is small and ``ds/dposition = diff/s`` is largest.
+    The existing adjoint tests use a 1--100 grid; this one puts both grid ends
+    close together and checks the same analytic-vs-finite-difference identity.
+    """
+    rng = np.random.default_rng(31)
+    box, n = 2.0, 300
+    pos = rng.uniform(0.0, box, (n, 3))
+    w = rng.uniform(0.5, 1.5, n)
+    edges = np.geomspace(0.01, 1.0, 11)
+    p = Particles(pos, w)
+    ba = BinAttrs(s=edges)
+    ma = MeshAttrs(p, p, boxsize=box, battrs=ba, periodic=True)
+    g = rng.normal(size=edges.size - 1)
+
+    got = count2_soft_vjp(p, p, battrs=ba, cotangent=g, mattrs=ma, backend='cpu')
+    gpos = np.asarray(got['grad_position1']) + np.asarray(got['grad_position2'])
+    # The gradient really is concentrated at small separations: at least one
+    # particle responds at O(10), not at rounding level.
+    assert np.max(np.abs(gpos)) > 1.0
+
+    def loss(positions):
+        q = Particles(positions, w)
+        mm = MeshAttrs(q, q, boxsize=box, battrs=ba, periodic=True)
+        return float(np.dot(
+            count2_soft(q, q, battrs=ba, mattrs=mm, backend='cpu')['weight'], g))
+
+    eps = 1e-6
+    ii, dd = np.unravel_index(np.argmax(np.abs(gpos)), gpos.shape)
+    plus, minus = pos.copy(), pos.copy()
+    plus[ii, dd] += eps
+    minus[ii, dd] -= eps
+    fd = (loss(plus) - loss(minus)) / (2 * eps)
+    assert fd == pytest.approx(gpos[ii, dd], rel=1e-6, abs=1e-6)
 
 
 @needs_cpu

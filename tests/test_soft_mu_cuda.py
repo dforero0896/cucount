@@ -22,8 +22,21 @@ import numpy as np
 import pytest
 
 from cucount.numpy import (BinAttrs, MeshAttrs, Particles, cudalib)
-from cucount.numpy import (count2, count2_soft, count2_soft_vjp, mu_grid,
+from cucount.numpy import (count2, count2_soft as _count2_soft,
+                           count2_soft_vjp as _count2_soft_vjp, mu_grid,
                            mu_kmax, mu_spec, soft_mu_weights, soft_weights)
+
+
+# Pin the unpadded estimator: the references here describe the softmax over the
+# real bins only.  test_soft_pad.py covers edge padding.
+def count2_soft(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return _count2_soft(*args, **kwargs)
+
+
+def count2_soft_vjp(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return _count2_soft_vjp(*args, **kwargs)
 
 # The reference tests below check the softmax math, the window and the adjoint
 # against exact references, so they pin the exact accumulator. The default
