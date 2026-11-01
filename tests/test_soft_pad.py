@@ -207,6 +207,33 @@ def test_padding_counts_pairs_beyond_the_original_edges():
 
 
 @needs_cpu
+def test_padded_soft_counts_track_hard_binning_at_the_upper_edge():
+    """Hard binning is exact; padding should remove the soft edge deficit.
+
+    A uniform catalogue makes the hard counts a smooth reference.  With a
+    kernel close to one bin wide, the unpadded soft estimator loses a
+    noticeable fraction of the last bin; padding restores the hard trend.
+    """
+    rng = np.random.default_rng(11)
+    p = Particles(rng.uniform(0.0, BOX, (2000, 3)))
+    edges = np.linspace(50.0, 150.0, 21)
+    ba = BinAttrs(s=edges)
+    ma = MeshAttrs(p, p, boxsize=BOX, battrs=ba, periodic=True)
+
+    hard = count2(p, p, battrs=ba, mattrs=ma, backend='cpu')['weight']
+    kwargs = dict(soft_sigma=4.0, soft_accum='float64', backend='cpu')
+    unpadded = count2_soft(p, p, battrs=ba, mattrs=ma, soft_pad=0.0,
+                           **kwargs)['weight']
+    padded = count2_soft(p, p, battrs=ba, mattrs=ma, **kwargs)['weight']
+
+    dev_unpadded = unpadded[-1] / hard[-1] - 1.0
+    dev_padded = padded[-1] / hard[-1] - 1.0
+    assert dev_unpadded < -0.05
+    assert abs(dev_padded) < 0.03
+    assert abs(dev_padded) < 0.3 * abs(dev_unpadded)
+
+
+@needs_cpu
 def test_padded_autocorrelation_removes_the_self_pair_on_the_padded_profile():
     """The self pair at s=0 deposits on the extended grid, then is sliced."""
     p, ba, ma = _setup(edges=ZERO_EDGES, weights=True)

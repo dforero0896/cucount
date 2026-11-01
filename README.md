@@ -416,6 +416,16 @@ per-block shared-memory histogram: `'float32'` (the default) is faster because A
 `atomicAdd(double*)` is a compare-and-swap loop, and costs a few `1e-7` relative on the
 counts; `'float64'` restores the bit-comparable path for conservation tests.
 
+A float32 sample dtype does not weaken the adjoint: the kernel computes it in `float64`
+and narrows only the returned gradient, and the float32 test compares it against the
+`float64` adjoint to `5e-5`. What *can* stall a float32 fit is the update, not the
+gradient: `xi = counts / norm` carries a `1/norm ~ 1/N^2` factor, so a correlation-function
+gradient can be far below the float32 ulp of a position near the box size. Adding it
+rounds back to the same position, and the loss repeats bit for bit even though the
+gradient is correct. If a positions-only fit is frozen, try `JAX_ENABLE_X64=1` (float64
+positions) or scale the loss/learning rate until `lr * gradient` exceeds the position
+ulp; `examples/soft_grad_precision.py` measures exactly where that threshold is.
+
 Soft binning runs on both backends. `backend='cuda'` scatters into per-block shared-memory
 histograms; `backend='cpu'` scatters into one `float64` histogram per thread and reduces
 them at the end, so the CPU kernel has no `soft_accum`/`soft_taps` occupancy trade-off --- it
@@ -436,7 +446,9 @@ soft kernel yet and raises `NotImplementedError` rather than falling back silent
 Both backends reject spin, angular upweights and split/jackknife requests instead of
 silently ignoring them. Runnable examples: `examples/soft_counts_lsstypes.py` (this
 frontend, isotropic and multipoles), `examples/soft_hist_grad_jax.py` (gradients through
-`cucount.jax.soft`).
+`cucount.jax.soft`), `examples/soft_pad_leakage.py` (unpadded vs padded soft counts
+against hard binning at the last edge) and `examples/soft_grad_precision.py` (why a
+normalized xi gradient can be too small for a float32 position update).
 
 ---
 

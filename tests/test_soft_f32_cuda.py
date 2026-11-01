@@ -98,6 +98,51 @@ for name, a, b in zip(('pos1', 'w1', 'pos2', 'w2'), grads,
     r = np.max(np.abs(np.asarray(a, dtype=np.float64) - b)) / np.max(np.abs(b))
     assert r < 5e-5, (name, r)
 
+# Small-scale, normalized correlation-function gradients. A real xi loss carries
+# cotangent ~ 1/norm, so the useful gradient at the first bins is many orders of
+# magnitude smaller than the raw counts gradient. The kernel must still return
+# the right number there -- precision of the *positions*, not of this arithmetic,
+# is what can stall a float32 optimizer.
+EDGES_SMALL = np.geomspace(0.05, 2.0, 16)
+BOX_SMALL = 5.0
+rng_s = np.random.default_rng(19)
+centres = rng_s.uniform(0.0, BOX_SMALL, (24, 3))
+pos_s = centres[rng_s.integers(0, len(centres), 480)] + rng_s.normal(0.0, 0.25, (480, 3))
+pos_s %= BOX_SMALL
+w_s = rng_s.uniform(0.5, 1.5, 480)
+battrs_s = cn.BinAttrs(s=EDGES_SMALL)
+p_s = cn.Particles(pos_s, w_s)
+mnp_s = cn.MeshAttrs(pos_s, pos_s, battrs=battrs_s, periodic=True, boxsize=BOX_SMALL)
+ref_s = nsoft.count2_soft(p_s, p_s, battrs=battrs_s, soft_cutoff=CUT,
+                          mattrs=mnp_s, soft_accum='float64')['weight']
+assert ref_s[0] > 0.0
+norm_s = w_s.sum() ** 2 - (w_s ** 2).sum()
+g_s = rng_s.normal(size=ref_s.shape) / norm_s
+
+mattrs_s = cjax.MeshAttrs(pos_s, pos_s, battrs=battrs_s, periodic=True,
+                          boxsize=BOX_SMALL)
+
+def loss_s(a, b, mattrs_s=mattrs_s, battrs_s=battrs_s, g_s=g_s):
+    h = cjax.count2_soft(cjax.Particles(a, b), battrs=battrs_s,
+                         soft_cutoff=CUT, mattrs=mattrs_s)['weight']
+    return jnp.sum(h * jnp.asarray(g_s, dtype=h.dtype))
+
+grads_s = jax.grad(loss_s)(jnp.asarray(pos_s, jnp.float32),
+                           jnp.asarray(w_s, jnp.float32))
+assert all(np.asarray(x).dtype == np.float32 for x in grads_s)
+adj_s = nsoft.count2_soft_vjp(p_s, p_s, battrs=battrs_s,
+                              cotangent=g_s, soft_cutoff=CUT, mattrs=mnp_s,
+                              soft_accum='float64')
+for name, a, b in zip(('pos', 'w'), grads_s,
+                      (adj_s['grad_position1'] + adj_s['grad_position2'],
+                       adj_s['grad_weight1'] + adj_s['grad_weight2'])):
+    assert np.max(np.abs(b)) > 0.0, name
+    r = np.max(np.abs(np.asarray(a, np.float64) - b)) / np.max(np.abs(b))
+    assert r < 5e-5, (name, r)
+# The xi-scale cotangent is what a real fit passes; the gradient is small but
+# well resolved in float64 arithmetic before the final narrowing.
+assert np.max(np.abs(np.asarray(grads_s[0], np.float64))) > 0.0
+
 # The flat (bin, multipole) slot layout must reshape in float32 too.
 refp = nsoft.count2_soft(p1, p2, battrs=battrs_pole, soft_cutoff=CUT,
                          mattrs=mnp_pole)['weight']
