@@ -93,8 +93,12 @@ def main():
     battrs_s = BinAttrs(s=EDGES)
     mattrs = _mattrs(p, battrs_s)
     hard = count2(p, battrs=battrs_s, mattrs=mattrs)['weight']
-    soft_default = count2_soft(p, battrs=battrs_s, mattrs=mattrs)['weight']
-    soft_wide = count2_soft(p, battrs=battrs_s, mattrs=mattrs, soft_sigma=4.0)['weight']
+    # Pin the unpadded estimator: this example compares its weight sum with the
+    # hard counts, while the default `soft_pad=2` also counts pairs beyond the
+    # binning range that leak back into the real bins.
+    soft_default = count2_soft(p, battrs=battrs_s, mattrs=mattrs, soft_pad=0.0)['weight']
+    soft_wide = count2_soft(p, battrs=battrs_s, mattrs=mattrs, soft_sigma=4.0,
+                            soft_pad=0.0)['weight']
 
     soft_meta = dict(soft_default.attrs)
     print(f'grid: {EDGES.size - 1} logarithmic bins in [{EDGES[0]:g}, {EDGES[-1]:g}]')
@@ -115,7 +119,8 @@ def main():
     battrs_p = BinAttrs(s=EDGES, pole=(ELLS, LOS))
     mattrs_p = _mattrs(p, battrs_p)
     hard_p = count2(p, battrs=battrs_p, mattrs=mattrs_p)['weight']
-    soft_p = count2_soft(p, battrs=battrs_p, mattrs=mattrs_p, soft_mu_sigma=0.05)['weight']
+    soft_p = count2_soft(p, battrs=battrs_p, mattrs=mattrs_p, soft_mu_sigma=0.05,
+                        soft_pad=0.0)['weight']
 
     hard_v, soft_v = _values(hard_p), _values(soft_p)
     print(f'\nmultipoles {ELLS} with los = {LOS!r}: '
@@ -147,7 +152,8 @@ def main():
 
     @jax.jit
     def jit_counts(pp, ww):
-        return count2_soft(JParticles(pp, ww), battrs=jbattrs, mattrs=jmattrs)['weight'].values('counts')
+        return count2_soft(JParticles(pp, ww), battrs=jbattrs, mattrs=jmattrs,
+                           soft_pad=0.0)['weight'].values('counts')
 
     def timed(fn):
         fn().block_until_ready()
@@ -172,7 +178,8 @@ def main():
     # d/dw sum(counts^2)/2 hands the adjoint the cotangent ``counts``
     loss = jax.jit(jax.grad(lambda ww: jnp.sum(jit_counts(pos, ww) ** 2) / 2))
     g_weight = np.asarray(loss(wts))
-    ref = nsoft.count2_soft_vjp(p, p, battrs=battrs_s, mattrs=mattrs, cotangent=counts_np)
+    ref = nsoft.count2_soft_vjp(p, p, battrs=battrs_s, mattrs=mattrs,
+                                cotangent=counts_np, soft_pad=0.0)
     ref_weight = ref['grad_weight1'] + ref['grad_weight2']
     print(f'  gradient through the wrapper vs the CUDA adjoint: '
           f'{np.max(np.abs(g_weight - ref_weight)) / np.max(np.abs(ref_weight)):.2e}')

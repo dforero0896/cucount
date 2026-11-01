@@ -17,8 +17,26 @@ import pytest
 
 from cucount.numpy import (BinAttrs, MeshAttrs, Particles, SplitAttrs,
                            cudalib, soft as nsoft)
-from cucount.types import count2, count2_soft
+from cucount.types import count2, count2_soft as _count2_soft
 from lsstypes import Count2Poles
+
+
+# Pin the unpadded estimator: the self-pair profiles and raw-frontend
+# references here describe the softmax over the real bins only.
+# test_soft_pad.py covers edge padding.
+def count2_soft(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return _count2_soft(*args, **kwargs)
+
+
+def _raw_soft(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return nsoft.count2_soft(*args, **kwargs)
+
+
+def _raw_soft_vjp(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return nsoft.count2_soft_vjp(*args, **kwargs)
 
 # The reference tests below check the softmax math, the window and the adjoint
 # against exact references, so they pin the exact accumulator. The default
@@ -91,8 +109,8 @@ def test_isotropic_counts_match_the_raw_frontend(s_min):
     battrs = BinAttrs(s=edges)
     DD = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight']
 
-    raw = np.asarray(nsoft.count2_soft(p, p, battrs=battrs,
-                                      mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight'])
+    raw = np.asarray(_raw_soft(p, p, battrs=battrs,
+                               mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight'])
     sumw2 = (_w(p)**2).sum()
     want = raw - sumw2 * _self_profile(edges)
 
@@ -119,8 +137,8 @@ def test_poles_match_the_raw_frontend():
     DD = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs),
                      soft_mu_sigma=0.05, soft_accum=ACC)['weight']
 
-    raw = np.asarray(nsoft.count2_soft(p, p, battrs=battrs, soft_mu_sigma=0.05,
-                                      mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight'])
+    raw = np.asarray(_raw_soft(p, p, battrs=battrs, soft_mu_sigma=0.05,
+                               mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight'])
     sumw2 = (_w(p)**2).sum()
     want = raw - sumw2 * _self_profile(edges, ELLS, soft_mu_sigma=0.05)
 
@@ -142,8 +160,8 @@ def test_cross_correlation_removes_no_self_pairs():
     battrs = BinAttrs(s=edges)
     DD = count2_soft(p1, p2, battrs=battrs, mattrs=_mattrs(p1, p2, battrs), soft_accum=ACC)['weight']
 
-    raw = np.asarray(nsoft.count2_soft(p1, p2, battrs=battrs,
-                                      mattrs=_mattrs(p1, p2, battrs), soft_accum=ACC)['weight'])
+    raw = np.asarray(_raw_soft(p1, p2, battrs=battrs,
+                               mattrs=_mattrs(p1, p2, battrs), soft_accum=ACC)['weight'])
     np.testing.assert_allclose(_counts(DD), raw, rtol=1e-15, atol=0.)
     np.testing.assert_allclose(np.ravel(DD.norm)[0],
                                _w(p1).sum() * _w(p2).sum(), rtol=1e-13)
@@ -210,8 +228,8 @@ def test_split_requests_are_rejected():
         count2_soft(p_split, battrs=battrs, spattrs=spattrs, mattrs=mattrs, soft_accum=ACC)
     # The raw frontend rejects it too, rather than silently dropping the splits.
     with pytest.raises(NotImplementedError, match='split'):
-        nsoft.count2_soft(p_split, p_split, battrs=battrs, spattrs=spattrs,
-                          mattrs=mattrs, soft_accum=ACC)
+        _raw_soft(p_split, p_split, battrs=battrs, spattrs=spattrs,
+                  mattrs=mattrs, soft_accum=ACC)
 
 
 @needs_cuda
@@ -340,9 +358,9 @@ def test_gradients_flow_through_the_wrapper():
         g_pos, g_weight = (np.asarray(g) for g in jax.jit(jax.grad(loss, argnums=(0, 1)))(pos, w))
 
         p_np = Particles(np.asarray(pos), np.asarray(w))
-        ref = nsoft.count2_soft_vjp(p_np, p_np, battrs=nbattrs,
-                                    mattrs=_mattrs(p_np, p_np, nbattrs),
-                                    cotangent=-np.sin(np.asarray(soft(pos, w))), **kw, soft_accum=ACC)
+        ref = _raw_soft_vjp(p_np, p_np, battrs=nbattrs,
+                            mattrs=_mattrs(p_np, p_np, nbattrs),
+                            cotangent=-np.sin(np.asarray(soft(pos, w))), **kw, soft_accum=ACC)
         for got, want in ((g_pos, ref['grad_position1'] + ref['grad_position2']),
                           (g_weight, ref['grad_weight1'] + ref['grad_weight2'])):
             scale = max(float(np.max(np.abs(want))), 1e-30)

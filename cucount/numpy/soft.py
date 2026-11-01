@@ -50,6 +50,8 @@ Differences from the oracle, both because the kernel is new rather than a port:
 """
 import numpy as np
 
+from ..softpad import (pad_cotangent, plan_padding,
+                       slice_soft_result, validate_soft_pad)
 from . import (
     BinAttrs,
     MeshAttrs,
@@ -106,6 +108,56 @@ def sigmas(edges, sigma=None):
     if not np.isfinite(sigma) or sigma <= 0.0:
         raise ValueError(f'sigma must be positive and finite, got {sigma!r}')
     return np.full(widths.shape, sigma, dtype=np.float64)
+
+
+def _s_edges(battrs):
+    """The separation axis of a BinAttrs as one monotone edge array."""
+    intervals = np.asarray(battrs.edges('s'), dtype=np.float64)
+    return np.concatenate([intervals[:, 0], intervals[-1:, 1]])
+
+
+def _battrs_with_edges(battrs, edges):
+    """A copy of ``battrs`` with the separation edges replaced."""
+    names = list(battrs.varnames)
+    if names == ['s']:
+        return BinAttrs(s=np.asarray(edges, dtype=np.float64))
+    if names == ['s', 'pole']:
+        ells = np.asarray(battrs.coords('pole'), dtype=np.int64)
+        los = str(battrs.losnames[names.index('pole')])
+        return BinAttrs(s=np.asarray(edges, dtype=np.float64), pole=(ells, los))
+    raise NotImplementedError(
+        'soft binning needs BinAttrs(s=edges) or BinAttrs(s=edges, pole=(ells, los))')
+
+
+def _pad_setup(particles, battrs, mattrs, sattrs, mode, soft_pad, soft_sigma):
+    """Plan the buffer bins and make the mesh reach them.
+
+    Returns ``(battrs_ext, edges_ext, edges_real, nlo, nhi, pad, mattrs,
+    soft_sigma)``.  The mesh is rebuilt only when the caller's mesh cannot see
+    the padded range, so an explicit mesh is otherwise left alone.
+    """
+    edges_real = _s_edges(battrs)
+    pad = validate_soft_pad(soft_pad)
+    if mattrs is None:
+        mattrs = MeshAttrs(*particles, sattrs=sattrs, battrs=battrs, backend=mode)
+    max_edge = None
+    if getattr(mattrs, 'periodic', False):
+        max_edge = 0.5 * float(np.min(np.asarray(mattrs.boxsize))) * (1.0 - 1e-9)
+    edges_ext, nlo, nhi, sig_pin = plan_padding(
+        edges_real, pad, soft_sigma, False, max_edge)
+    if nlo == 0 and nhi == 0:
+        return battrs, edges_real, edges_real, 0, 0, pad, mattrs, soft_sigma
+
+    battrs_ext = _battrs_with_edges(battrs, edges_ext)
+    want = float(edges_ext[-1]) * (1.0 - 1e-9)
+    if float(np.asarray(mattrs.smax)) < want:
+        mattrs = MeshAttrs(*particles, boxsize=mattrs.boxsize,
+                           boxcenter=mattrs.boxcenter,
+                           periodic=mattrs.periodic, sattrs=sattrs,
+                           battrs=battrs_ext, backend=mode)
+    if sig_pin is not None and soft_sigma is None:
+        soft_sigma = float(sig_pin)
+    return battrs_ext, edges_ext, edges_real, nlo, nhi, pad, mattrs, soft_sigma
 
 
 def mu_spec(soft_mu_sigma=None, soft_mu_bins=0, soft_mu_edges=None,
@@ -273,7 +325,7 @@ def soft_weights(s, edges, sigma=None):
 
 def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
                 soft_cutoff: float=1e-13, soft_taps: str='exact',
-                soft_accum: str='float32',
+                soft_accum: str='float32', soft_pad: float=None,
                 soft_mu_sigma: float=None, soft_mu_bins: int=0,
                 soft_mu_edges=None,
                 wattrs: WeightAttrs=None,
@@ -313,6 +365,18 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
         the only cost is rounding when each block adds its partial sum to the
         output histogram (a few 1e-7 relative). Use ``'float64'`` to recover the
         previous bit-comparable path, e.g. for conservation tests at 1e-15.
+    soft_pad : float, optional
+        Edge padding in kernel widths. The traversal only counts pairs inside
+        the binning range, so without padding the outermost bins average a
+        *truncated* kernel: the last bin is biased high and the first low. With
+        ``soft_pad = z`` the counting range is extended by ``z`` kernel widths
+        with buffer bins (geometric continuation on a log grid, arithmetic
+        otherwise); the softmax normalises over the real and buffer centres, and
+        the buffer bins are dropped from the returned counts. ``None`` selects
+        the pyfcfc default, ``z = 2``; ``0`` restores the previous estimator
+        bit for bit. In a periodic box the extension is clamped below ``L/2``.
+        Padding costs the extra pairs in the buffer shells (roughly
+        ``exp(3 z f) - 1`` at the upper edge for log bins).
     soft_mu_sigma : float, optional
         Width of the mu kernel, in mu units, for a request whose second axis is
         ``pole=(ells, los)``. ``None`` (or 0) means half a mu bin. The mu axis is
@@ -364,15 +428,17 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
     mode = _resolve_backend(backend)
     cuda_tuning, cpu_tuning = _resolve_tuning(mode, tuning, nthreads=nthreads)
 
-    if mattrs is None:
-        mattrs = MeshAttrs(*particles, sattrs=sattrs, battrs=battrs, backend=mode)
+    (battrs_ext, edges_ext, edges_real, nlo, nhi, pad, mattrs,
+     soft_sigma) = _pad_setup(particles, battrs, mattrs, sattrs, mode,
+                              soft_pad, soft_sigma)
+    ns_real = int(edges_real.size - 1)
 
     cparticles = [_to_c_particles(p) for p in particles]
 
     def run(which, tuning):
         lib, lib_nthreads = _lib_and_nthreads(which, tuning)
         result, timings = lib.count2_soft(
-            *cparticles, mattrs._to_c(), battrs,
+            *cparticles, mattrs._to_c(), battrs_ext,
             wattrs=wattrs._to_c(), sattrs=sattrs, spattrs=spattrs,
             soft_sigma=soft_sigma, soft_cutoff=float(soft_cutoff),
             soft_taps=str(soft_taps), soft_accum=str(soft_accum),
@@ -382,12 +448,14 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
         _log_timings(which, *timings)
         return result
 
-    return _dispatch(mode, run, cuda_tuning, cpu_tuning)
+    result = _dispatch(mode, run, cuda_tuning, cpu_tuning)
+    return slice_soft_result(result, nlo, nhi, ns_real, edges_ext, pad)
 
 
 def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
                     soft_sigma: float=None, soft_cutoff: float=1e-13,
                     soft_taps: str='exact', soft_accum: str='float32',
+                    soft_pad: float=None,
                     soft_mu_sigma: float=None,
                     soft_mu_bins: int=0, soft_mu_edges=None,
                     wattrs: WeightAttrs=None, sattrs: SelectionAttrs=None,
@@ -422,8 +490,10 @@ def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
         contribute to the position gradients (through ``dmu/dposition``), so the
         adjoint is the derivative of the *multipoles*, not of a frozen mu.
     cotangent : array_like
-        One entry per histogram slot, ``dL/dcounts``: ``(nbins,)`` for soft ``s``
-        or ``(nbins, nell)`` (any layout with ``nbins * nell`` entries).
+        One entry per *real* histogram slot, ``dL/dcounts``: ``(nbins,)`` for
+        soft ``s`` or ``(nbins, nell)``.  With padding the buffer-bin
+        cotangents are zero internally: the buffer bins are discarded from the
+        forward counts, so the caller never sees them.
 
     Returns
     -------
@@ -456,17 +526,34 @@ def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
     mode = _resolve_backend(backend)
     cuda_tuning, cpu_tuning = _resolve_tuning(mode, tuning, nthreads=nthreads)
 
-    if mattrs is None:
-        mattrs = MeshAttrs(*particles, sattrs=sattrs, battrs=battrs, backend=mode)
+    (battrs_ext, edges_ext, edges_real, nlo, nhi, pad, mattrs,
+     soft_sigma) = _pad_setup(particles, battrs, mattrs, sattrs, mode,
+                              soft_pad, soft_sigma)
+    ns_real = int(edges_real.size - 1)
 
     cparticles = [_to_c_particles(p) for p in particles]
 
-    cotangent = np.ascontiguousarray(cotangent, dtype=np.float64)
+    cotangent = np.asarray(cotangent, dtype=np.float64)
+    if cotangent.ndim == 1:
+        # A flattened (nbins, nell) cotangent is accepted as before; only the
+        # separation axis is resized by the buffer bins.
+        if cotangent.size != ns_real and ns_real and cotangent.size % ns_real == 0:
+            cotangent = cotangent.reshape(ns_real, -1)
+    if cotangent.ndim not in (1, 2):
+        raise ValueError(f'cotangent must be 1D or 2D, got shape {cotangent.shape}')
+    if cotangent.shape[0] != ns_real:
+        raise ValueError(
+            'the cotangent must have one entry per real separation bin, got '
+            f'{cotangent.shape[0]} rows for {ns_real} bins')
+    if nlo or nhi:
+        cotangent = pad_cotangent(cotangent, nlo, int(edges_ext.size - 1))
+    else:
+        cotangent = np.ascontiguousarray(cotangent)
 
     def run(which, tuning):
         lib, lib_nthreads = _lib_and_nthreads(which, tuning)
         result, timings = lib.count2_soft_vjp(
-            *cparticles, mattrs._to_c(), battrs, cotangent,
+            *cparticles, mattrs._to_c(), battrs_ext, cotangent,
             wattrs=wattrs._to_c(), sattrs=sattrs, spattrs=spattrs,
             soft_sigma=soft_sigma, soft_cutoff=float(soft_cutoff),
             soft_taps=str(soft_taps), soft_accum=str(soft_accum),
@@ -476,4 +563,5 @@ def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
         _log_timings(which, *timings)
         return result
 
-    return _dispatch(mode, run, cuda_tuning, cpu_tuning)
+    result = _dispatch(mode, run, cuda_tuning, cpu_tuning)
+    return slice_soft_result(result, nlo, nhi, ns_real, edges_ext, pad)

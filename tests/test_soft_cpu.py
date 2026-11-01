@@ -18,8 +18,21 @@ import pytest
 
 from cucount.numpy import (BinAttrs, MeshAttrs, Particles, SelectionAttrs,
                            SplitAttrs, WeightAttrs, cpulib)
-from cucount.numpy import count2, count2_soft, count2_soft_vjp
+from cucount.numpy import count2, count2_soft as _count2_soft, count2_soft_vjp as _count2_soft_vjp
 from cucount.numpy.soft import mu_spec, soft_mu_weights, soft_weights
+
+
+# This module pins the unpadded estimator: its O(N^2) references and its
+# conservation checks describe the softmax over the real bins only.  Edge
+# padding is exercised in test_soft_pad.py.
+def count2_soft(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return _count2_soft(*args, **kwargs)
+
+
+def count2_soft_vjp(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return _count2_soft_vjp(*args, **kwargs)
 
 needs_cpu = pytest.mark.skipif(cpulib is None, reason='CPU extension not built')
 

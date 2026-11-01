@@ -53,7 +53,9 @@ from jax.sharding import PartitionSpec as P
 
 from . import Particles, WeightAttrs, MeshAttrs, SelectionAttrs, SplitAttrs, BinAttrs
 from . import _resolve_ffi_backend, _stack_values, default_sharding_mesh
-from ..numpy.soft import default_sigma, is_uniform, mu_spec
+from ..numpy.soft import (default_sigma, is_uniform, mu_spec,
+                          _battrs_with_edges)
+from ..softpad import plan_padding, validate_soft_pad
 
 NDIM = 3
 
@@ -173,7 +175,7 @@ def _vjp_bufsize(particles, mattrs, nbins=0, mu_entries=0):
 @default_sharding_mesh
 def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = None,
                 soft_cutoff: float = 1e-13, soft_taps: str = 'exact',
-                soft_accum: str = 'float32',
+                soft_accum: str = 'float32', soft_pad: float = None,
                 soft_mu_sigma: float = None, soft_mu_bins: int = 0,
                 soft_mu_edges=None,
                 wattrs: WeightAttrs = None,
@@ -223,6 +225,14 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
         1.5-3x faster than ``'float64'`` on Ampere and later, at the cost of a
         few 1e-7 relative when each block adds its partial sum to the output.
         Pass ``'float64'`` for bit-comparable runs (conservation at 1e-15).
+    soft_pad : float, optional
+        Edge padding in kernel widths. Without it the last separation bin is
+        biased high (and the first low), because the traversal truncates the
+        infinite Gaussian at the outermost edges. ``z`` extends the counting
+        range by ``z`` kernel widths with buffer bins, normalises the softmax
+        over real and buffer centres, then drops the buffer bins;
+        ``None`` selects two kernel widths and ``0`` restores the old estimator.
+        The cotangent of the backward pass refers to the real bins only.
     soft_mu_sigma : float, optional
         Width of the mu kernel, in mu units, when ``battrs`` carries a pole axis.
         ``None`` (or 0) means half a mu bin. The mu axis defaults to a uniform
@@ -274,22 +284,55 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
         raise NotImplementedError('split/jackknife counts are not served by the soft kernel yet')
 
     edges, ells, los = _soft_axes(battrs)
-    spec = _soft_spec(edges, soft_sigma, soft_cutoff, soft_taps, soft_accum,
+    if mattrs is None:
+        mattrs = MeshAttrs(*particles, sattrs=sattrs, battrs=battrs, backend=mode)
+    pad = validate_soft_pad(soft_pad)
+    max_edge = None
+    if getattr(mattrs, 'periodic', False):
+        max_edge = 0.5 * float(np.min(np.asarray(mattrs.boxsize))) * (1.0 - 1e-9)
+    edges_ext, nlo, nhi, sig_pin = plan_padding(
+        edges, pad, soft_sigma, False, max_edge)
+    if nlo == 0 and nhi == 0:
+        battrs_ext = battrs
+        edges_ext = edges
+    else:
+        battrs_ext = _battrs_with_edges(battrs, edges_ext)
+        want = float(edges_ext[-1]) * (1.0 - 1e-9)
+        if float(np.asarray(mattrs.smax)) < want:
+            mattrs = MeshAttrs(*particles, boxsize=mattrs.boxsize,
+                               boxcenter=mattrs.boxcenter,
+                               periodic=mattrs.periodic, sattrs=sattrs,
+                               battrs=battrs_ext, backend=mode)
+    if sig_pin is not None and soft_sigma is None:
+        soft_sigma = float(sig_pin)
+
+    spec = _soft_spec(edges_ext, soft_sigma, soft_cutoff, soft_taps, soft_accum,
                       soft_mu_sigma, soft_mu_bins, ells, los, soft_mu_edges)
-    nbins = spec['nbins']
-    slots = spec['slots']
-    shape = (nbins,) if ells is None else (nbins, int(ells.size))
+    nbins_ext = int(edges_ext.size - 1)
+    nbins = int(edges.size - 1)
+    nell = 1 if ells is None else int(ells.size)
+    slots_ext = nbins_ext * nell
+    slots = nbins * nell
+    # The public spec describes the real bins; keep the padded size and offsets
+    # so a caller can reproduce the buffer layout (the lsstypes wrapper uses the
+    # extended edges for the self-pair profile).
+    spec['nbins'] = nbins
+    spec['slots'] = slots
+    spec['nbins_padded'] = nbins_ext
+    spec['soft_pad'] = float(pad)
+    spec['pad_lo'] = int(nlo)
+    spec['pad_hi'] = int(nhi)
+    if nlo or nhi:
+        spec['s_edges_ext'] = np.asarray(edges_ext, dtype=np.float64)
+    shape = (nbins,) if ells is None else (nbins, nell)
     # A non-arithmetic mu grid needs the three device tables (centres, per-cell
     # inverse variances, edges) inside the scratch buffer the FFI call is given.
     mu_entries = (0 if ells is None or spec.get('mu_uniform', True)
                   else 3 * int(spec['mu_bins']) + 1)
 
-    if mattrs is None:
-        mattrs = MeshAttrs(*particles, sattrs=sattrs, battrs=battrs, backend=mode)
-
     # Attribute state is process-global in the FFI module (as it is for count2),
     # so the soft request is resolved once and read by both fwd and bwd handlers.
-    ffi_module.set_count2_soft_attrs(mattrs._to_c(), battrs, wattrs=wattrs._to_c(),
+    ffi_module.set_count2_soft_attrs(mattrs._to_c(), battrs_ext, wattrs=wattrs._to_c(),
                                      sattrs=sattrs, spattrs=spattrs,
                                      soft_sigma=0. if soft_sigma is None else float(soft_sigma),
                                      soft_cutoff=float(soft_cutoff),
@@ -347,16 +390,22 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
     def _lens(ops):
         return [int(ops[starts[icat]].shape[0]) for icat in range(2)]
 
+    def _real_bins(flat):
+        """Slice buffer bins off a flat or (padded, nell) histogram."""
+        if ells is not None:
+            return flat.reshape((nbins_ext, nell))[nlo:nlo + nbins]
+        return flat[nlo:nlo + nbins]
+
     def _local_forward(*ops):
         n = _lens(ops)
         # The kernel writes one flat slot per (s bin, multipole), so the FFI
         # buffer is 1-D and the public shape is restored outside the kernel.
-        counts_type = jax.ShapeDtypeStruct((slots,), sample_dtype)
+        counts_type = jax.ShapeDtypeStruct((slots_ext,), sample_dtype)
         buffer_type = jax.ShapeDtypeStruct(
-            (_scratch(sample_width, _bufsize(meshsize, n, nbins, mu_entries)),),
+            (_scratch(sample_width, _bufsize(meshsize, n, nbins_ext, mu_entries)),),
             sample_dtype)
         fwd = jax.ffi.ffi_call(ffi_names[0] + suffix, (counts_type, buffer_type))
-        return fwd(*ops)[0].reshape(shape)
+        return _real_bins(fwd(*ops)[0])
 
     def _local_bwd(ops, cotangent):
         n = _lens(ops)
@@ -369,11 +418,25 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
             jax.ShapeDtypeStruct((n[1],), sample_dtype),
             jax.ShapeDtypeStruct((1,), sample_dtype),
             jax.ShapeDtypeStruct(
-                (_scratch(sample_width, _bufsize(meshsize, n, nbins, mu_entries)),),
+                (_scratch(sample_width, _bufsize(meshsize, n, nbins_ext, mu_entries)),),
                 sample_dtype),
         )
+        # The caller's cotangent covers the real bins; the buffer bins were
+        # dropped from the forward result, so their cotangent is zero.  They do
+        # enter the softmax normalisation, which the adjoint replays exactly.
+        if nlo or nhi:
+            if ells is not None:
+                cot = jnp.zeros((nbins_ext, nell), dtype=cotangent.dtype)
+                cot = cot.at[nlo:nlo + nbins].set(
+                    cotangent.reshape((nbins, nell)))
+            else:
+                cot = jnp.zeros((nbins_ext,), dtype=cotangent.dtype)
+                cot = cot.at[nlo:nlo + nbins].set(cotangent)
+            cotangent = cot.reshape((slots_ext,))
+        else:
+            cotangent = cotangent.reshape((slots_ext,))
         vjp = jax.ffi.ffi_call(ffi_names[1] + suffix, outputs)
-        gpos1, gpos2, gw1, gw2, _gsigma, _buf = vjp(*ops, cotangent.reshape((slots,)))
+        gpos1, gpos2, gw1, gw2, _gsigma, _buf = vjp(*ops, cotangent)
         grads = []
         for p, hw, gpos, gw in zip(particles, has_weights, (gpos1, gpos2), (gw1, gw2)):
             grads.append(gpos.reshape((-1, NDIM)))

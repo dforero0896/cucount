@@ -17,7 +17,19 @@ import numpy as np
 import pytest
 
 from cucount.numpy import BinAttrs, MeshAttrs, Particles, cudalib
-from cucount.numpy import count2_soft, count2_soft_vjp
+from cucount.numpy import count2_soft as _count2_soft, count2_soft_vjp as _count2_soft_vjp
+
+
+# Pin the unpadded estimator: finite differences below are of the unpadded
+# forward.  test_soft_pad.py covers the padded adjoint.
+def count2_soft(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return _count2_soft(*args, **kwargs)
+
+
+def count2_soft_vjp(*args, **kwargs):
+    kwargs.setdefault('soft_pad', 0.0)
+    return _count2_soft_vjp(*args, **kwargs)
 
 # The reference tests below check the softmax math, the window and the adjoint
 # against exact references, so they pin the exact accumulator. The default

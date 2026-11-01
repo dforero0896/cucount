@@ -342,8 +342,9 @@ automatically.
 ### 🌫️ Soft binning
 
 `count2` places every pair in exactly one bin. `count2_soft` shares it between
-neighbouring bins with a Gaussian softmax around each bin centre instead: counts move
-between bins but total weight is conserved, and `soft_sigma -> 0` recovers `count2`.
+neighbouring bins with a Gaussian softmax around each bin centre instead: the
+weights of every counted pair sum to one over the real and buffer centres, and
+`soft_sigma -> 0` recovers `count2`.
 It returns the same `Count2` / `Count2Poles` containers, and `attrs` records the soft
 configuration (`soft_sigma`, `soft_cutoff`, `soft_multipoles`, ...).
 
@@ -383,7 +384,23 @@ differentiable --- gradients need the soft kernel.
 `soft_sigma` defaults to half a bin: on a non-uniform grid it is half of *each* bin, so
 `attrs['soft_sigma']` is the multiplier of the local width (`soft_sigma_kind='width'`),
 while on an arithmetic grid it is an absolute width (`'absolute'`). Pass a number for a
-constant width in separation units. `soft_cutoff` drops the Gaussian tail (the window is renormalized, so weight stays
+constant width in separation units.
+
+`soft_pad` controls the edge truncation. The kernel spreads each pair with a Gaussian
+of infinite support, but only traverses pairs inside `[s_edges[0], s_edges[-1])`, so the
+outermost bins average a *half* kernel: the last bin comes out biased high (and the
+first low), and the bias grows with the steepness of the correlation function and the
+kernel width. `soft_pad=z` extends the counting range by `z` kernel widths with
+**buffer bins** (geometric continuation on a log grid, arithmetic otherwise), lets the
+softmax normalise over the real and buffer centres, and drops the buffer bins from the
+result. `None` selects the pyfcfc default `z=2`; `soft_pad=0` restores the previous
+estimator bit for bit. In a periodic box the extended maximum edge is clamped below
+`L/2` (the minimum-image limit), and the lower edge never goes below zero. The buffer
+bins make the traversal enumerate the extra pairs in those shells --- roughly
+`exp(3 z f) - 1` more at the upper edge for log bins --- and `attrs` records the layout
+as `soft_pad`, `soft_pad_lo`, `soft_pad_hi` and `soft_nbins_padded`.
+
+`soft_cutoff` drops the Gaussian tail (the window is renormalized, so weight stays
 conserved) and `soft_taps='fast'` trades ~1e-6 weight accuracy for speed on non-uniform
 grids. For multipoles the mu quadrature is a uniform grid over the full `[-1, 1]` (mu is
 not folded, so odd multipoles keep their sign): `soft_mu_bins` sets its resolution and
