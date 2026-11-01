@@ -124,10 +124,11 @@ mattrs_s = cjax.MeshAttrs(pos_s, pos_s, battrs=battrs_s, periodic=True,
 
 def loss_s(a, b, mattrs_s=mattrs_s, battrs_s=battrs_s, g_s=g_s):
     h = cjax.count2_soft(cjax.Particles(a, b), battrs=battrs_s,
-                         soft_cutoff=CUT, mattrs=mattrs_s)['weight']
+                         soft_cutoff=CUT, mattrs=mattrs_s,
+                         soft_accum='float64')['weight']
     return jnp.sum(h * jnp.asarray(g_s, dtype=h.dtype))
 
-grads_s = jax.grad(loss_s)(jnp.asarray(pos_s, jnp.float32),
+grads_s = jax.grad(loss_s, argnums=(0, 1))(jnp.asarray(pos_s, jnp.float32),
                            jnp.asarray(w_s, jnp.float32))
 assert all(np.asarray(x).dtype == np.float32 for x in grads_s)
 adj_s = nsoft.count2_soft_vjp(p_s, p_s, battrs=battrs_s,
@@ -153,7 +154,7 @@ assert gotp.shape == refp.shape and gotp.dtype == np.float32
 r = np.max(np.abs(np.asarray(gotp) - refp)) / np.max(np.abs(refp))
 assert r < 2e-5, r
 
-print('F32 OK')
+print('F32 OK!')
 '''
 
 

@@ -116,7 +116,9 @@ def test_isotropic_counts_match_the_raw_frontend(s_min):
 
     assert type(DD).__name__ == 'Count2'
     assert np.shape(_counts(DD)) == (edges.size - 1,)
-    np.testing.assert_allclose(_counts(DD), want, rtol=0., atol=0.)
+    # values('counts') is normalized_counts * norm: this can differ from the
+    # raw counts by one ulp even when the wrapper adds no self-pair subtraction.
+    np.testing.assert_allclose(_counts(DD), want, rtol=1e-14, atol=1e-14)
 
     # The normalization is the hard one: (sum w)^2 - sum w^2 for an autocorrelation.
     np.testing.assert_allclose(np.ravel(DD.norm)[0],
@@ -144,7 +146,9 @@ def test_poles_match_the_raw_frontend():
 
     assert type(DD).__name__ == 'Count2Poles'
     assert [pole.ell for pole in DD] == ELLS
-    np.testing.assert_allclose(_counts(DD), want, rtol=0., atol=0.)
+    # values('counts') is normalized_counts * norm: this can differ from the
+    # raw counts by one ulp even when the wrapper adds no self-pair subtraction.
+    np.testing.assert_allclose(_counts(DD), want, rtol=1e-14, atol=1e-14)
     assert list(np.atleast_1d(DD.get(0).attrs['soft_multipoles'])) == ELLS
 
     # l = 0 is the isotropic soft count, as in the kernel.

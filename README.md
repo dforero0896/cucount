@@ -418,13 +418,20 @@ counts; `'float64'` restores the bit-comparable path for conservation tests.
 
 A float32 sample dtype does not weaken the adjoint: the kernel computes it in `float64`
 and narrows only the returned gradient, and the float32 test compares it against the
-`float64` adjoint to `5e-5`. What *can* stall a float32 fit is the update, not the
-gradient: `xi = counts / norm` carries a `1/norm ~ 1/N^2` factor, so a correlation-function
-gradient can be far below the float32 ulp of a position near the box size. Adding it
-rounds back to the same position, and the loss repeats bit for bit even though the
-gradient is correct. If a positions-only fit is frozen, try `JAX_ENABLE_X64=1` (float64
-positions) or scale the loss/learning rate until `lr * gradient` exceeds the position
-ulp; `examples/soft_grad_precision.py` measures exactly where that threshold is.
+`float64` adjoint to `5e-5`. Two things *can* make a fit look frozen even though the
+gradient is correct. First, the weighting: `xi = counts / norm` carries a
+`1/norm ~ 1/N^2` factor, so the gradient of a normalized-xi loss is `~1/N^2` of the raw
+counts gradient. A power-spectrum loss has no such factor, so in a joint objective the
+P(k) term can dominate the update by four or five orders of magnitude: P(k) trains and
+moves the particles while the xi term never gets a comparable step. Fit counts instead
+(multiply the xi cotangent by `norm`), or otherwise weight the two terms to comparable
+gradient scale; rescaling the whole loss does not change the relative weight. Second,
+the update precision: even when xi is the only term, a tiny gradient added to a float32
+position near the box size can round back to the same bits, and a default Adam `eps`
+can dominate a `~1e-9` gradient. Try `JAX_ENABLE_X64=1` (float64 positions), a smaller
+Adam `eps`, or the counts loss above. `examples/soft_grad_training.py` reproduces the
+joint P(k)/xi case with both position precisions and shows the counts-loss fix;
+`examples/soft_grad_precision.py` measures the float32 ulp threshold.
 
 Soft binning runs on both backends. `backend='cuda'` scatters into per-block shared-memory
 histograms; `backend='cpu'` scatters into one `float64` histogram per thread and reduces
@@ -447,8 +454,10 @@ Both backends reject spin, angular upweights and split/jackknife requests instea
 silently ignoring them. Runnable examples: `examples/soft_counts_lsstypes.py` (this
 frontend, isotropic and multipoles), `examples/soft_hist_grad_jax.py` (gradients through
 `cucount.jax.soft`), `examples/soft_pad_leakage.py` (unpadded vs padded soft counts
-against hard binning at the last edge) and `examples/soft_grad_precision.py` (why a
-normalized xi gradient can be too small for a float32 position update).
+against hard binning at the last edge), `examples/soft_grad_training.py` (why a joint
+P(k)+xi loss can leave xi untrained, and how fitting counts fixes it) and
+`examples/soft_grad_precision.py` (why a normalized xi gradient can be too small for a
+float32 position update).
 
 ---
 
