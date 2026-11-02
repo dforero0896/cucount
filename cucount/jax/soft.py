@@ -11,7 +11,8 @@ softmax of a Gaussian centred on the bin centres,
     counts_i += w_pair * W_i,
 
 so each pair's total weight is conserved and ``sigma -> 0`` recovers hard
-binning. Only the separation axis is softened, and only CUDA serves it so far.
+binning. Only the separation axis is softened; both the CUDA and the CPU
+backend serve it.
 
 A request whose binning is ``BinAttrs(s=edges, pole=(ells, los))`` additionally
 softens the mu axis, which is what makes differentiable multipoles. Each pair
@@ -24,7 +25,7 @@ still a *coordinate* (it enters the kernel as the pair's own mu), so the adjoint
 carries dM_l/dmu; the mu grid itself is not differentiated.
 
 What is new here is differentiability. The counts are wrapped in
-``jax.custom_vjp`` whose backward calls the CUDA adjoint kernel
+``jax.custom_vjp`` whose backward calls the backend's adjoint kernel
 (``count2_soft_vjp``, the same VJP pyfcfc exposes as ``soft_hist_vjp``): the
 windowed-softmax forward is differentiated in closed form, so one backward pass
 costs about one forward pass instead of carrying per-pair taps through autodiff.
@@ -52,7 +53,8 @@ from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
 from . import Particles, WeightAttrs, MeshAttrs, SelectionAttrs, SplitAttrs, BinAttrs
-from . import _resolve_ffi_backend, _stack_values, default_sharding_mesh
+from . import (_resolve_ffi_backend, _stack_values, default_sharding_mesh,
+               get_cpu_nthreads)
 from ..numpy.soft import (default_sigma, is_uniform, mu_spec,
                           _battrs_with_edges)
 from ..softpad import plan_padding, validate_soft_pad
@@ -194,7 +196,7 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
     Drop-in neighbour of :func:`cucount.jax.count2` for the isotropic soft case:
     same particle containers, same ``{'weight': counts}`` return, and it can be
     differentiated with ``jax.grad``/``jax.value_and_grad`` w.r.t. positions and
-    individual weights. The backward pass is the CUDA adjoint kernel, so a
+    individual weights. The backward pass is the backend's adjoint kernel, so a
     gradient costs roughly one extra forward pass.
 
     Parameters
@@ -266,8 +268,8 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
         plus the resolved soft parameters.
     """
     mode, ffi_module, suffix = _resolve_ffi_backend(backend)
-    if mode != 'cuda':
-        raise NotImplementedError('soft binning is served by the CUDA backend only for now')
+    if mode == 'cpu':
+        ffi_module.set_nthreads(get_cpu_nthreads())
     if len(particles) == 1:
         particles = (particles[0], particles[0])
     if len(particles) != 2:
@@ -308,6 +310,12 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
 
     spec = _soft_spec(edges_ext, soft_sigma, soft_cutoff, soft_taps, soft_accum,
                       soft_mu_sigma, soft_mu_bins, ells, los, soft_mu_edges)
+    if mode == 'cpu':
+        # The CPU histogram is double per thread whatever soft_accum says, and the
+        # report should say so exactly as the numpy frontend does.
+        spec['accum'] = 'float64'
+        spec['path'] = 'threads'
+        spec['copies'] = 0
     nbins_ext = int(edges_ext.size - 1)
     nbins = int(edges.size - 1)
     nell = 1 if ells is None else int(ells.size)
@@ -401,9 +409,14 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
         # The kernel writes one flat slot per (s bin, multipole), so the FFI
         # buffer is 1-D and the public shape is restored outside the kernel.
         counts_type = jax.ShapeDtypeStruct((slots_ext,), sample_dtype)
-        buffer_type = jax.ShapeDtypeStruct(
-            (_scratch(sample_width, _bufsize(meshsize, n, nbins_ext, mu_entries)),),
-            sample_dtype)
+        if mode == 'cpu':
+            # The CPU handler allocates its own per-thread histograms and ignores
+            # the scratch buffer, exactly as the hard count2 CPU handler does.
+            buffer_type = jax.ShapeDtypeStruct((1,), sample_dtype)
+        else:
+            buffer_type = jax.ShapeDtypeStruct(
+                (_scratch(sample_width, _bufsize(meshsize, n, nbins_ext, mu_entries)),),
+                sample_dtype)
         fwd = jax.ffi.ffi_call(ffi_names[0] + suffix, (counts_type, buffer_type))
         return _real_bins(fwd(*ops)[0])
 
@@ -417,7 +430,8 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float = Non
             jax.ShapeDtypeStruct((n[0],), sample_dtype),
             jax.ShapeDtypeStruct((n[1],), sample_dtype),
             jax.ShapeDtypeStruct((1,), sample_dtype),
-            jax.ShapeDtypeStruct(
+            jax.ShapeDtypeStruct((1,), sample_dtype) if mode == 'cpu'
+            else jax.ShapeDtypeStruct(
                 (_scratch(sample_width, _bufsize(meshsize, n, nbins_ext, mu_entries)),),
                 sample_dtype),
         )

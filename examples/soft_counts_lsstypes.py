@@ -13,8 +13,8 @@ the comparison a user actually cares about:
   constant.
 
 The counts above run on either backend (``CUCOUNT_BACKEND=cpu`` forces the CPU
-kernel); the jit/gradient panel needs a GPU, because ``cucount.jax.soft`` is
-CUDA-only for now::
+kernel), and so do the jit/gradient panels: ``cucount.jax.soft`` has both CUDA
+and CPU FFI handlers::
 
     python examples/soft_counts_lsstypes.py
 

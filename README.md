@@ -448,8 +448,12 @@ achievable (the soft kernel keeps scaling one thread doubling longer). Quote tho
 only with the thread count pinned: `backend='cpu'` defaults to the *affinity mask*, so a
 timing taken on a login node is an oversubscription measurement.
 
-JAX soft counts (`cucount.jax.soft`) are still CUDA-only: the CPU has no FFI handler for the
-soft kernel yet and raises `NotImplementedError` rather than falling back silently.
+JAX soft counts (`cucount.jax.soft`) run on both backends. The CPU FFI handler computes
+the histogram with one private `float64` histogram per OpenMP thread, exactly like the
+NumPy frontend, and exposes the same four FFI targets (`count2_soft[_f32]` and
+`count2_soft_vjp[_f32]`); `backend='cpu'` therefore supports `jax.jit`, `jax.grad` and the
+float32 sample path without a GPU. On CPU the reported `soft['accum']` is `'float64'` and
+`soft['path']` is `'threads'`, matching `cucount.numpy.soft`.
 Both backends reject spin, angular upweights and split/jackknife requests instead of
 silently ignoring them. Runnable examples: `examples/soft_counts_lsstypes.py` (this
 frontend, isotropic and multipoles), `examples/soft_hist_grad_jax.py` (gradients through
