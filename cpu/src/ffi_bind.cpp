@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "count2.h"
+#include "count2_soft.h"
 #include "count3close.h"
 
 #define CUCOUNT_NO_CUDA
@@ -95,6 +96,12 @@ WeightAttrs wattrs2;
 SplitAttrs spattrs2;
 IndexValue index_value2[2] = {};
 
+// Soft binning rides the count2 attrs; only the resolved tap window is
+// extra state. soft_mu_edges2 owns the optional caller-supplied mu grid,
+// which soft_spec2 points into (as the CUDA module does).
+SoftBinSpec soft_spec2;
+std::vector<double> soft_mu_edges2;
+
 OwnedArrays owned3;
 MeshAttrs mattrs3_1, mattrs3_2, mattrs3_3;
 BinAttrs battrs3_12, battrs3_13, battrs3_23;
@@ -132,6 +139,64 @@ void set_count2_attrs_py(MeshAttrs_py mattrs_py, BinAttrs_py battrs_py,
     spattrs2 = spattrs_py.data();
     owned2.own(&battrs2);
     owned2.own(&wattrs2);
+}
+
+
+// ---------------------------------------------------------------------------
+// Soft (Gaussian-softmax) request setter
+// ---------------------------------------------------------------------------
+
+// The soft kernel is an extension, so its request is resolved into a
+// SoftBinSpec here and kept beside the count2 attrs rather than inside them.
+void set_count2_soft_attrs_py(
+    MeshAttrs_py mattrs_py, BinAttrs_py battrs_py,
+    WeightAttrs_py wattrs_py = WeightAttrs_py(),
+    const SelectionAttrs_py sattrs_py = SelectionAttrs_py(),
+    const SplitAttrs_py spattrs_py = SplitAttrs_py(),
+    double soft_sigma = 0., double soft_cutoff = 1e-13,
+    const std::string& soft_taps = "exact",
+    const std::string& soft_accum = "float32",
+    double soft_mu_sigma = 0., int soft_mu_bins = 0,
+    py::object soft_mu_edges = py::none()) {
+    if (mattrs_py.data().type != MESH_CARTESIAN)
+        throw std::invalid_argument(
+            "cpu backend, soft binning: only cartesian meshes are served");
+
+    owned2.clear();
+
+    mattrs2 = mattrs_py.data();
+    battrs2 = battrs_py.data();
+    wattrs2 = wattrs_py.data();
+    sattrs2 = sattrs_py.data();
+    spattrs2 = spattrs_py.data();
+    owned2.own(&battrs2);
+    owned2.own(&wattrs2);
+
+    soft_mu_edges2.clear();
+    if (!soft_mu_edges.is_none()) {
+        using Arr = py::array_t<double, py::array::c_style | py::array::forcecast>;
+        Arr arr = py::cast<Arr>(soft_mu_edges);
+        soft_mu_edges2.assign(arr.data(), arr.data() + arr.size());
+    }
+
+    size_t csize = 0;
+    soft_spec2 = make_soft_bin_spec(
+        battrs2, wattrs2, spattrs2, soft_sigma, soft_cutoff, &csize,
+        soft_mu_sigma, soft_mu_bins,
+        soft_mu_edges2.empty() ? nullptr : soft_mu_edges2.data(),
+        static_cast<int>(soft_mu_edges2.size()),
+        /*acc_float=*/0, /*backend=*/"cpu");
+
+    if (soft_taps == "fast") soft_spec2.fast_taps = 1;
+    else if (soft_taps != "exact")
+        throw std::invalid_argument(
+            "cpu backend, soft binning: soft_taps must be one of 'exact', 'fast'");
+
+    // The CPU accumulator is double whatever the caller asks for; the string is
+    // accepted for signature parity with the CUDA module.
+    if (soft_accum != "float32" && soft_accum != "float64")
+        throw std::invalid_argument(
+            "cpu backend, soft binning: soft_accum must be one of 'float32', 'float64'");
 }
 
 void set_count2_index_value_py(int iparticle, int size_split, int size_spin,
@@ -395,6 +460,241 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::Buffer<ffi::F64>>()
 );
 
+
+// ---------------------------------------------------------------------------
+// Soft (Gaussian-softmax) handlers
+// ---------------------------------------------------------------------------
+
+template <ffi::DataType DT>
+double soft_read(const ffi::Buffer<DT>& b, size_t i) {
+    return static_cast<double>(b.typed_data()[i]);
+}
+
+template <ffi::DataType DT>
+ffi::Error count2SoftImpl(ffi::Buffer<DT> positions1, ffi::Buffer<DT> values1,
+                          ffi::Buffer<DT> positions2, ffi::Buffer<DT> values2,
+                          ffi::ResultBuffer<DT> counts,
+                          ffi::ResultBuffer<DT> buffer) {
+    (void)buffer;  // device scratch on the CUDA side; unused here
+
+    const size_t n1 = positions1.dimensions().front();
+    const size_t n2 = positions2.dimensions().front();
+    const size_t nval1 = values1.dimensions().size() == 0 ? 0 : values1.dimensions().front();
+    const size_t nval2 = values2.dimensions().size() == 0 ? 0 : values2.dimensions().front();
+
+    std::vector<double> p1buf, v1buf, p2buf, v2buf, histbuf;
+    const double* p1;
+    const double* v1;
+    const double* p2;
+    const double* v2;
+    double* hist;
+
+    if constexpr (DT == ffi::F64) {
+        p1 = positions1.typed_data();
+        v1 = values1.typed_data();
+        p2 = positions2.typed_data();
+        v2 = values2.typed_data();
+        hist = counts->typed_data();
+    }
+    else {
+        p1buf.resize(NDIM * n1);
+        v1buf.resize(nval1);
+        p2buf.resize(NDIM * n2);
+        v2buf.resize(nval2);
+        for (size_t i = 0; i < NDIM * n1; ++i) p1buf[i] = soft_read(positions1, i);
+        for (size_t i = 0; i < nval1; ++i) v1buf[i] = soft_read(values1, i);
+        for (size_t i = 0; i < NDIM * n2; ++i) p2buf[i] = soft_read(positions2, i);
+        for (size_t i = 0; i < nval2; ++i) v2buf[i] = soft_read(values2, i);
+        p1 = p1buf.data(); v1 = v1buf.data();
+        p2 = p2buf.data(); v2 = v2buf.data();
+        histbuf.resize((size_t) soft_spec2.nslots);
+        hist = histbuf.data();
+    }
+
+    std::memset(hist, 0, (size_t) soft_spec2.nslots * sizeof(double));
+
+    Count2SoftArgs a;
+    a.p1.positions = const_cast<double*>(p1);
+    a.p1.values = const_cast<double*>(v1);
+    a.p1.size = n1;
+    a.p1.index_value = index_value2[0];
+    a.p2.positions = const_cast<double*>(p2);
+    a.p2.values = const_cast<double*>(v2);
+    a.p2.size = n2;
+    a.p2.index_value = index_value2[1];
+    a.attrs.mattrs = mattrs2;
+    a.attrs.battrs = battrs2;
+    a.attrs.wattrs = wattrs2;
+    a.attrs.sattrs = sattrs2;
+    a.attrs.spattrs = spattrs2;
+    a.spec = &soft_spec2;
+    a.out = hist;
+    a.nthreads = staged_nthreads;
+    a.timings = nullptr;
+
+    Count2Soft(a);
+
+    if constexpr (DT != ffi::F64) {
+        for (int i = 0; i < soft_spec2.nslots; ++i)
+            counts->typed_data()[i] = static_cast<float>(hist[i]);
+    }
+
+    return ffi::Error::Success();
+}
+
+template <ffi::DataType DT>
+ffi::Error count2SoftVjpImpl(ffi::Buffer<DT> positions1, ffi::Buffer<DT> values1,
+                             ffi::Buffer<DT> positions2, ffi::Buffer<DT> values2,
+                             ffi::Buffer<DT> cotangent,
+                             ffi::ResultBuffer<DT> grad_positions1,
+                             ffi::ResultBuffer<DT> grad_positions2,
+                             ffi::ResultBuffer<DT> grad_values1,
+                             ffi::ResultBuffer<DT> grad_values2,
+                             ffi::ResultBuffer<DT> grad_sigma,
+                             ffi::ResultBuffer<DT> buffer) {
+    (void)buffer;
+
+    const size_t n1 = positions1.dimensions().front();
+    const size_t n2 = positions2.dimensions().front();
+    const size_t nval1 = values1.dimensions().size() == 0 ? 0 : values1.dimensions().front();
+    const size_t nval2 = values2.dimensions().size() == 0 ? 0 : values2.dimensions().front();
+    const size_t nc = (size_t) soft_spec2.nslots;
+
+    std::vector<double> p1buf, v1buf, p2buf, v2buf, cotbuf;
+    std::vector<double> gp1buf, gp2buf, gw1buf, gw2buf, gsbuf;
+    const double* p1;
+    const double* v1;
+    const double* p2;
+    const double* v2;
+    const double* cot;
+    double* gpos1;
+    double* gpos2;
+    double* gw1;
+    double* gw2;
+    double* gsigma;
+
+    if constexpr (DT == ffi::F64) {
+        p1 = positions1.typed_data();
+        v1 = values1.typed_data();
+        p2 = positions2.typed_data();
+        v2 = values2.typed_data();
+        cot = cotangent.typed_data();
+        gpos1 = grad_positions1->typed_data();
+        gpos2 = grad_positions2->typed_data();
+        gw1 = grad_values1->typed_data();
+        gw2 = grad_values2->typed_data();
+        gsigma = grad_sigma->typed_data();
+    }
+    else {
+        p1buf.resize(NDIM * n1);
+        v1buf.resize(nval1);
+        p2buf.resize(NDIM * n2);
+        v2buf.resize(nval2);
+        cotbuf.resize(nc);
+        gp1buf.resize(NDIM * n1);
+        gp2buf.resize(NDIM * n2);
+        gw1buf.resize(n1);
+        gw2buf.resize(n2);
+        gsbuf.resize(1);
+        for (size_t i = 0; i < NDIM * n1; ++i) p1buf[i] = soft_read(positions1, i);
+        for (size_t i = 0; i < nval1; ++i) v1buf[i] = soft_read(values1, i);
+        for (size_t i = 0; i < NDIM * n2; ++i) p2buf[i] = soft_read(positions2, i);
+        for (size_t i = 0; i < nval2; ++i) v2buf[i] = soft_read(values2, i);
+        for (size_t i = 0; i < nc; ++i) cotbuf[i] = soft_read(cotangent, i);
+        p1 = p1buf.data(); v1 = v1buf.data();
+        p2 = p2buf.data(); v2 = v2buf.data();
+        cot = cotbuf.data();
+        gpos1 = gp1buf.data(); gpos2 = gp2buf.data();
+        gw1 = gw1buf.data(); gw2 = gw2buf.data();
+        gsigma = gsbuf.data();
+    }
+
+    std::memset(gpos1, 0, NDIM * n1 * sizeof(double));
+    std::memset(gpos2, 0, NDIM * n2 * sizeof(double));
+    std::memset(gw1, 0, n1 * sizeof(double));
+    std::memset(gw2, 0, n2 * sizeof(double));
+    std::memset(gsigma, 0, sizeof(double));
+
+    Count2SoftVjpArgs a;
+    a.p1.positions = const_cast<double*>(p1);
+    a.p1.values = const_cast<double*>(v1);
+    a.p1.size = n1;
+    a.p1.index_value = index_value2[0];
+    a.p2.positions = const_cast<double*>(p2);
+    a.p2.values = const_cast<double*>(v2);
+    a.p2.size = n2;
+    a.p2.index_value = index_value2[1];
+    a.attrs.mattrs = mattrs2;
+    a.attrs.battrs = battrs2;
+    a.attrs.wattrs = wattrs2;
+    a.attrs.sattrs = sattrs2;
+    a.attrs.spattrs = spattrs2;
+    a.spec = &soft_spec2;
+    a.cotangent = cot;
+    a.grad_position1 = gpos1;
+    a.grad_position2 = gpos2;
+    a.grad_weight1 = gw1;
+    a.grad_weight2 = gw2;
+    a.grad_sigma = gsigma;
+    a.nthreads = staged_nthreads;
+    a.timings = nullptr;
+
+    Count2SoftVjp(a);
+
+    if constexpr (DT != ffi::F64) {
+        for (size_t i = 0; i < NDIM * n1; ++i)
+            grad_positions1->typed_data()[i] = static_cast<float>(gpos1[i]);
+        for (size_t i = 0; i < NDIM * n2; ++i)
+            grad_positions2->typed_data()[i] = static_cast<float>(gpos2[i]);
+        for (size_t i = 0; i < n1; ++i)
+            grad_values1->typed_data()[i] = static_cast<float>(gw1[i]);
+        for (size_t i = 0; i < n2; ++i)
+            grad_values2->typed_data()[i] = static_cast<float>(gw2[i]);
+        grad_sigma->typed_data()[0] = static_cast<float>(gsigma[0]);
+    }
+
+    return ffi::Error::Success();
+}
+
+#define CUCOUNT_DEFINE_SOFT_FFI(NAME, IMPL, TYPE)                            \
+XLA_FFI_DEFINE_HANDLER_SYMBOL(                                               \
+    NAME, IMPL<TYPE>,                                                        \
+    ffi::Ffi::Bind()                                                         \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+);
+
+CUCOUNT_DEFINE_SOFT_FFI(count2Softffi, count2SoftImpl, ffi::F64)
+CUCOUNT_DEFINE_SOFT_FFI(count2SoftF32ffi, count2SoftImpl, ffi::F32)
+
+#undef CUCOUNT_DEFINE_SOFT_FFI
+
+#define CUCOUNT_DEFINE_SOFT_VJP_FFI(NAME, IMPL, TYPE)                        \
+XLA_FFI_DEFINE_HANDLER_SYMBOL(                                               \
+    NAME, IMPL<TYPE>,                                                        \
+    ffi::Ffi::Bind()                                                         \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Arg<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+        .Ret<ffi::Buffer<TYPE>>()                                            \
+);
+
+CUCOUNT_DEFINE_SOFT_VJP_FFI(count2SoftVjpffi, count2SoftVjpImpl, ffi::F64)
+CUCOUNT_DEFINE_SOFT_VJP_FFI(count2SoftVjpF32ffi, count2SoftVjpImpl, ffi::F32)
+
+#undef CUCOUNT_DEFINE_SOFT_VJP_FFI
+
 ffi::Error count3Impl(ffi::Buffer<ffi::F64> positions1, ffi::Buffer<ffi::F64> values1,
                       ffi::Buffer<ffi::F64> positions2, ffi::Buffer<ffi::F64> values2,
                       ffi::Buffer<ffi::F64> positions3, ffi::Buffer<ffi::F64> values3,
@@ -521,6 +821,22 @@ PYBIND11_MODULE(ffi_cpu, m) {
     m.def("get_count2_layout", &get_count2_layout_py,
           "Return (names, shape) for count2 outputs.");
     m.def("count2", []() { return EncapsulateFfiCall(count2ffi); });
+
+
+    m.def("set_count2_soft_attrs", &set_count2_soft_attrs_py,
+          py::arg("mattrs"), py::arg("battrs"),
+          py::arg("wattrs") = WeightAttrs_py(),
+          py::arg("sattrs") = SelectionAttrs_py(),
+          py::arg("spattrs") = SplitAttrs_py(),
+          py::arg("soft_sigma") = 0., py::arg("soft_cutoff") = 1e-13,
+          py::arg("soft_taps") = "exact",
+          py::arg("soft_accum") = "float32",
+          py::arg("soft_mu_sigma") = 0., py::arg("soft_mu_bins") = 0,
+          py::arg("soft_mu_edges") = py::none());
+    m.def("count2_soft", []() { return EncapsulateFfiCall(count2Softffi); });
+    m.def("count2_soft_vjp", []() { return EncapsulateFfiCall(count2SoftVjpffi); });
+    m.def("count2_soft_f32", []() { return EncapsulateFfiCall(count2SoftF32ffi); });
+    m.def("count2_soft_vjp_f32", []() { return EncapsulateFfiCall(count2SoftVjpF32ffi); });
 
     // The unqualified names the CUDA FFI module also carries for count2, so
     // the jax frontend can hold either module behind one name.
