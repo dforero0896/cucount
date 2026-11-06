@@ -744,6 +744,7 @@ static py::dict soft_meta(const SoftBinSpec &spec)
     soft["accum"] = spec.acc_float ? "float32" : "float64";
     soft["cutoff"] = spec.cutoff;
     soft["kmax"] = spec.kmax;
+    soft["norm"] = spec.norm_softmax ? "softmax" : "gaussian";
     // Only the uniform path has a fixed window length; the general path expands
     // until the cutoff stops it, so its tap count depends on the pair.
     soft["taps"] = spec.uniform ? 2 * spec.kmax + 1 : -1;
@@ -815,6 +816,7 @@ py::object count2_soft_py(
     const double soft_cutoff = 1e-13,
     const std::string &soft_taps = "exact",
     const std::string &soft_accum = "float32",
+    const std::string &soft_norm = "gaussian",
     py::object soft_mu_sigma_obj = py::none(),
     const int soft_mu_bins = 0,
     py::object soft_mu_edges_obj = py::none(),
@@ -852,7 +854,8 @@ py::object count2_soft_py(
     SoftBinSpec spec = make_soft_bin_spec(
         battrs, wattrs, spattrs, soft_sigma, soft_cutoff, &csize,
         soft_mu_sigma, soft_mu_bins,
-        mu_edges.empty() ? nullptr : mu_edges.data(), (int) mu_edges.size());
+        mu_edges.empty() ? nullptr : mu_edges.data(), (int) mu_edges.size(),
+        /*acc_float=*/1, /*backend=*/"cuda", soft_norm.c_str());
 
     // The general (non-uniform) path pays one exp per tap per pass; 'fast'
     // swaps them for __expf (~1e-6 relative) when the caller prefers speed.
@@ -1003,6 +1006,7 @@ py::object count2_soft_vjp_py(
     const double soft_cutoff = 1e-13,
     const std::string &soft_taps = "exact",
     const std::string &soft_accum = "float32",
+    const std::string &soft_norm = "gaussian",
     py::object soft_mu_sigma_obj = py::none(),
     const int soft_mu_bins = 0,
     py::object soft_mu_edges_obj = py::none(),
@@ -1038,7 +1042,8 @@ py::object count2_soft_vjp_py(
     SoftBinSpec spec = make_soft_bin_spec(
         battrs, wattrs, spattrs, soft_sigma, soft_cutoff, &csize,
         soft_mu_sigma, soft_mu_bins,
-        mu_edges.empty() ? nullptr : mu_edges.data(), (int) mu_edges.size());
+        mu_edges.empty() ? nullptr : mu_edges.data(), (int) mu_edges.size(),
+        /*acc_float=*/1, /*backend=*/"cuda", soft_norm.c_str());
 
     // The general (non-uniform) path pays one exp per tap per pass; 'fast'
     // swaps them for __expf (~1e-6 relative) when the caller prefers speed.
@@ -1195,7 +1200,7 @@ PYBIND11_MODULE(cuda, m) {
 
     m.def("count2_soft", &count2_soft_py,
         "Take particle positions and weights (numpy arrays), perform 2-pt counts on the GPU with "
-        "Gaussian-softmax soft binning on the separation axis, and return a numpy array. "
+        "Gaussian soft binning on the separation axis, and return a numpy array. "
         "soft_sigma is in separation units; None means half a bin. With a 'pole' axis the "
         "mu axis is softened too and the result is soft multipoles, shape (nbins, nell).",
         py::arg("particles1"),
@@ -1209,6 +1214,7 @@ PYBIND11_MODULE(cuda, m) {
         py::arg("soft_cutoff") = 1e-13,
         py::arg("soft_taps") = "exact",
         py::arg("soft_accum") = "float32",
+        py::arg("soft_norm") = "gaussian",
         py::arg("soft_mu_sigma") = py::none(),
         py::arg("soft_mu_bins") = 0,
         py::arg("soft_mu_edges") = py::none(),
@@ -1234,6 +1240,7 @@ PYBIND11_MODULE(cuda, m) {
         py::arg("soft_cutoff") = 1e-13,
         py::arg("soft_taps") = "exact",
         py::arg("soft_accum") = "float32",
+        py::arg("soft_norm") = "gaussian",
         py::arg("soft_mu_sigma") = py::none(),
         py::arg("soft_mu_bins") = 0,
         py::arg("soft_mu_edges") = py::none(),

@@ -2,12 +2,17 @@
 
 Hard binning is exact: every pair inside ``[edges[0], edges[-1])`` is counted
 once, and pairs outside are simply not in the histogram.  The soft histogram
-instead gives each counted pair a Gaussian softmax over the bin centres.  That
+instead gives each counted pair a Gaussian kernel over the bin centres.  That
 kernel has infinite support, but the pair traversal stops at the outermost
-edges, so without padding the boundary bins are normalised over a truncated set
-of centres and get the wrong share of the pair weight.  ``soft_pad`` extends the
-counting range with buffer bins, normalises the softmax over the extended
-centres, and then drops the buffer bins from the result.
+edges, so without padding the boundary bins see a truncated kernel: the legacy
+``soft_norm='softmax'`` inflates them by renormalising over the inward-only
+window, while the default ``soft_norm='gaussian'`` simply misses the tail that
+fell outside.  ``soft_pad`` extends the counting range with buffer bins, lets
+the kernel deposit over the extended centres (the softmax also normalises over
+them), and then drops the buffer bins from the result.  The example runs the
+``soft_norm='softmax'`` mode, where that bias has a definite sign; the default
+``soft_norm='gaussian'`` kernel is biased in the opposite direction but by a
+comparable amount, and ``soft_pad`` fixes both.
 
 This example uses a uniform random catalogue, so the hard counts are a smooth
 reference and any soft-to-hard discrepancy is easy to read.  The separation grid
@@ -59,8 +64,13 @@ def catalogue(n=N, box=BOX, seed=11):
 
 
 def _counts(p, battrs, mattrs, pad):
+    # Pinned to the softmax normalisation: it gives the edge bias a definite
+    # sign (the truncated window is renormalised inward), which is what the
+    # panels show.  The default gaussian kernel is biased the same way in
+    # magnitude but in the opposite direction, since it drops the tail instead
+    # of redistributing it, and soft_pad fixes both.
     return count2_soft(p, p, battrs=battrs, mattrs=mattrs,
-                       soft_sigma=SIGMA, soft_pad=pad,
+                       soft_sigma=SIGMA, soft_pad=pad, soft_norm='softmax',
                        soft_accum='float64', backend=BACKEND)
 
 

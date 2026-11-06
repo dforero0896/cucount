@@ -143,7 +143,7 @@ void set_count2_attrs_py(MeshAttrs_py mattrs_py, BinAttrs_py battrs_py,
 
 
 // ---------------------------------------------------------------------------
-// Soft (Gaussian-softmax) request setter
+// Soft (Gaussian, optionally softmax-normalised) request setter
 // ---------------------------------------------------------------------------
 
 // The soft kernel is an extension, so its request is resolved into a
@@ -156,6 +156,7 @@ void set_count2_soft_attrs_py(
     double soft_sigma = 0., double soft_cutoff = 1e-13,
     const std::string& soft_taps = "exact",
     const std::string& soft_accum = "float32",
+    const std::string& soft_norm = "gaussian",
     double soft_mu_sigma = 0., int soft_mu_bins = 0,
     py::object soft_mu_edges = py::none()) {
     if (mattrs_py.data().type != MESH_CARTESIAN)
@@ -185,7 +186,7 @@ void set_count2_soft_attrs_py(
         soft_mu_sigma, soft_mu_bins,
         soft_mu_edges2.empty() ? nullptr : soft_mu_edges2.data(),
         static_cast<int>(soft_mu_edges2.size()),
-        /*acc_float=*/0, /*backend=*/"cpu");
+        /*acc_float=*/0, /*backend=*/"cpu", soft_norm.c_str());
 
     if (soft_taps == "fast") soft_spec2.fast_taps = 1;
     else if (soft_taps != "exact")
@@ -462,7 +463,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 
 
 // ---------------------------------------------------------------------------
-// Soft (Gaussian-softmax) handlers
+// Soft (Gaussian, softmax or quadrature-normalised) handlers
 // ---------------------------------------------------------------------------
 
 template <ffi::DataType DT>
@@ -831,6 +832,7 @@ PYBIND11_MODULE(ffi_cpu, m) {
           py::arg("soft_sigma") = 0., py::arg("soft_cutoff") = 1e-13,
           py::arg("soft_taps") = "exact",
           py::arg("soft_accum") = "float32",
+          py::arg("soft_norm") = "gaussian",
           py::arg("soft_mu_sigma") = 0., py::arg("soft_mu_bins") = 0,
           py::arg("soft_mu_edges") = py::none());
     m.def("count2_soft", []() { return EncapsulateFfiCall(count2Softffi); });

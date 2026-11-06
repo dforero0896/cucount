@@ -1,8 +1,17 @@
 #ifndef _CUCOUNT_SOFT_
 #define _CUCOUNT_SOFT_
 
-// Host-side contract of soft (Gaussian-softmax) binning, shared by the CUDA and
-// the CPU backends.
+// Host-side contract of soft (Gaussian) binning, shared by the CUDA and the CPU
+// backends.
+//
+// Two normalisations are served, selected by ``soft_norm``:
+//
+//  * "gaussian" (default): W_b = A_b exp(-x_b), with the quadrature prefactor
+//    A_b = (edges[b+1] - edges[b]) / (sqrt(2 pi) sigma_b), so each pair deposits
+//    ~1 total weight without a per-pair reduction. Only one pass over the taps,
+//    which is the point of the mode.
+//  * "softmax" (legacy): W_b = exp(-x_b) / sum_j exp(-x_j), exactly normalised
+//    over the window, two passes.
 //
 // Semantics, the sigma rules and the two grid paths (arithmetic recurrence vs
 // per-tap window) are documented in cuda/include/count2_soft.h, which is where
@@ -62,6 +71,17 @@ struct SoftBinSpec {
     // and the tap weights are always computed in float64: only the accumulator
     // is narrowed, so pair selection is identical either way.
     int acc_float;
+    // Normalisation mode: 1 = legacy Gaussian-softmax (divide by the window
+    // sum), 0 = plain normalised Gaussian (one pass, quadrature prefactor).
+    int norm_softmax;
+    // Constant per-bin quadrature prefactor A for the plain Gaussian, valid
+    // only when norm_softmax == 0. 0 is a sentinel meaning "varies per bin":
+    // the kernel then derives A_b from the edges and inv2s2. Nonzero for every
+    // uniform grid and for a non-uniform grid with width-scaled sigma.  There
+    // is no mu counterpart: the mu axis is always renormalised (mu is confined
+    // to [-1, 1], a bounded domain where a plain kernel would lose mass at the
+    // poles).
+    FLOAT s_kernel_norm;
     FLOAT sigma;         // the absolute sigma when per_bin_sigma == 0
     FLOAT alpha;         // sigma_i / local width when per_bin_sigma == 1
     FLOAT thresh;        // ln(1 / cutoff): the logit distance that truncates
@@ -73,6 +93,12 @@ struct SoftBinSpec {
     // bin, which only shows up when the kernel is narrow enough for the error
     // not to be covered by the window.
     FLOAT *edges;             // nbins + 1 (general path only; device or host)
+    // Per-bin quadrature prefactor A_b for a non-arithmetic grid AND one absolute
+    // sigma: the width then varies from bin to bin, so A_b cannot be folded into
+    // the scalar above. Precomputed on the host because the alternative is a
+    // sqrt per kernel tap, which on the adjoint costs more than the second pass
+    // the plain-Gaussian mode is meant to save. null otherwise.
+    const FLOAT *quad_norm;   // nbins (general path, absolute sigma; host or device)
 
     // --- multipoles (soft mu) ---------------------------------------------
     //
@@ -140,11 +166,20 @@ inline SoftBinSpec make_soft_bin_spec(const BinAttrs &battrs, const WeightAttrs 
                                       double mu_sigma = 0., int mu_bins = 0,
                                       const FLOAT *mu_edges = nullptr,
                                       int mu_nedges = 0, int acc_float = 1,
-                                      const char *backend = "cuda")
+                                      const char *backend = "cuda",
+                                      const char *norm = "gaussian")
 {
     // The messages name the backend that refused the request, so a caller can
     // tell which one ran (both share this resolution, by construction).
     const std::string prefix = std::string(backend) + " backend, soft binning: ";
+
+    const std::string norm_mode = (norm != nullptr) ? norm : "gaussian";
+
+    if (norm_mode != "gaussian" && norm_mode != "softmax") {
+        throw std::invalid_argument(
+            std::string(prefix) + "soft_norm must be 'gaussian' or 'softmax', got '" +
+            norm_mode + "'");
+    }
 
     // Two requests are served: 's' alone (isotropic clustering) and
     // 's' + 'pole' (soft mu binning, i.e. differentiable multipoles). The pole
@@ -247,8 +282,11 @@ inline SoftBinSpec make_soft_bin_spec(const BinAttrs &battrs, const WeightAttrs 
     spec.centres = nullptr;
     spec.inv2s2 = nullptr;
     spec.edges = nullptr;
+    spec.quad_norm = nullptr;
     spec.fast_taps = 0;
     spec.acc_float = acc_float ? 1 : 0;
+    spec.norm_softmax = (norm_mode == "softmax") ? 1 : 0;
+    spec.s_kernel_norm = 0;
 
     // sigma <= 0 or None means "half a bin", the pyfcfc default: at that width a
     // pair keeps ~68% of its weight on its own bin and the rest on the two
@@ -303,7 +341,7 @@ inline SoftBinSpec make_soft_bin_spec(const BinAttrs &battrs, const WeightAttrs 
     spec.path = 0;
 
     // ------------------------------------------------------------------
-    // Multipole axis: the mu quadrature grid and its softmax width.
+    // Multipole axis: the mu quadrature grid and its kernel width.
     // ------------------------------------------------------------------
     //
     // By default the grid is uniform over [-1, 1] whatever the s grid is: the
@@ -492,6 +530,24 @@ inline SoftBinSpec make_soft_bin_spec(const BinAttrs &battrs, const WeightAttrs 
     spec.nslots = spec.nbins * (spec.nell > 0 ? spec.nell : 1);
     *csize = spec.nslots;
 
+    // Plain-Gaussian quadrature prefactors. 1 / sqrt(2 pi) is folded in here,
+    // once per call, so the kernels only multiply. A zero sentinel means the
+    // prefactor varies per bin (a non-uniform grid with one absolute sigma) and
+    // the kernel derives it from the local width and inv2s2.
+    if (!spec.norm_softmax) {
+        const double inv_sqrt_two_pi = 0.3989422804014327;
+
+        if (uniform) {
+            spec.s_kernel_norm =
+                (FLOAT) (ds * inv_sqrt_two_pi / (double) spec.sigma);
+        }
+        else if (spec.per_bin_sigma) {
+            spec.s_kernel_norm =
+                (FLOAT) (inv_sqrt_two_pi / (double) spec.alpha);
+        }
+
+    }
+
     return spec;
 }
 
@@ -510,6 +566,7 @@ inline void soft_build_host_tables(SoftBinSpec &spec,
                                   std::vector<FLOAT> &s_centres,
                                   std::vector<FLOAT> &s_inv2s2,
                                   std::vector<FLOAT> &s_edges,
+                                  std::vector<FLOAT> &s_quad_norm,
                                   std::vector<FLOAT> &mu_centres,
                                   std::vector<FLOAT> &mu_inv2s2,
                                   std::vector<FLOAT> &mu_edges)
@@ -537,6 +594,21 @@ inline void soft_build_host_tables(SoftBinSpec &spec,
         spec.centres = s_centres.data();
         spec.inv2s2 = s_inv2s2.data();
         spec.edges = s_edges.data();
+
+        // Plain-Gaussian mode with one absolute sigma: the width varies, so the
+        // prefactor has to as well. Anything else leaves s_kernel_norm nonzero
+        // and never touches the table.
+        if (!spec.norm_softmax && spec.s_kernel_norm == 0) {
+            const FLOAT inv_sqrt_pi = (FLOAT) 0.564189583547756286948;
+            s_quad_norm.resize(n);
+
+            for (size_t i = 0; i < n; ++i) {
+                const FLOAT width = s_edges[i + 1] - s_edges[i];
+                s_quad_norm[i] = width * std::sqrt(s_inv2s2[i]) * inv_sqrt_pi;
+            }
+
+            spec.quad_norm = s_quad_norm.data();
+        }
     }
 
     // The mu grid needs the same treatment when it is not arithmetic.

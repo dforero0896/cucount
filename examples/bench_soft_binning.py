@@ -83,6 +83,10 @@ def main():
         lib = cudalib
         ma = mesh(edges)
         ba = BinAttrs(s=edges)
+        # Pinned to the softmax normalisation: the quoted dW/W column is the
+        # conservation check, and only this mode conserves weight exactly.
+        # Pass soft_norm='gaussian' for the default quadrature kernel.
+        kwargs.setdefault('soft_norm', 'softmax')
         return lib.count2_soft(cparts, cparts, ma._to_c(), ba, wattrs=wattrs,
                                sattrs=sattrs, spattrs=spattrs, nthreads=1,
                                return_timings=True, **kwargs)
@@ -91,6 +95,7 @@ def main():
         lib = cudalib
         ma = mesh(edges)
         ba = BinAttrs(s=edges)
+        kwargs.setdefault('soft_norm', 'softmax')
         return lib.count2_soft_vjp(cparts, cparts, ma._to_c(), ba, cotangent,
                                    wattrs=wattrs, sattrs=sattrs,
                                    spattrs=spattrs, nthreads=1,

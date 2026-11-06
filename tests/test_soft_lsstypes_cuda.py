@@ -22,7 +22,7 @@ from lsstypes import Count2Poles
 
 
 # Pin the unpadded estimator: the self-pair profiles and raw-frontend
-# references here describe the softmax over the real bins only.
+# references here describe the kernel over the real bins only.
 # test_soft_pad.py covers edge padding.
 def count2_soft(*args, **kwargs):
     kwargs.setdefault('soft_pad', 0.0)
@@ -38,7 +38,7 @@ def _raw_soft_vjp(*args, **kwargs):
     kwargs.setdefault('soft_pad', 0.0)
     return nsoft.count2_soft_vjp(*args, **kwargs)
 
-# The reference tests below check the softmax math, the window and the adjoint
+# The reference tests below check the kernel math, the window and the adjoint
 # against exact references, so they pin the exact accumulator. The default
 # float32 shared-memory tile costs a few 1e-7 relative on the counts (see
 # test_soft_s_cuda.py::test_float32_accumulation_is_the_default); at 1e-12
@@ -151,9 +151,14 @@ def test_poles_match_the_raw_frontend():
     np.testing.assert_allclose(_counts(DD), want, rtol=1e-14, atol=1e-14)
     assert list(np.atleast_1d(DD.get(0).attrs['soft_multipoles'])) == ELLS
 
-    # l = 0 is the isotropic soft count, as in the kernel.
-    iso = count2_soft(p, battrs=BinAttrs(s=edges), mattrs=_mattrs(p, p, battrs), soft_accum=ACC)['weight']
-    np.testing.assert_allclose(_counts(DD)[:, 0], _counts(iso), rtol=1e-13, atol=1e-15)
+    # The mu axis is renormalised in every mode, so l = 0 is exactly the
+    # isotropic soft count -- including under the default gaussian weights.
+    kw = dict(soft_mu_sigma=0.05, soft_accum=ACC)
+    DDmono = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs), **kw)['weight']
+    iso = count2_soft(p, battrs=BinAttrs(s=edges), mattrs=_mattrs(p, p, battrs),
+                      soft_accum=ACC)['weight']
+    np.testing.assert_allclose(_counts(DDmono)[:, 0], _counts(iso), rtol=1e-13,
+                               atol=1e-15)
 
 
 @needs_cuda
@@ -264,8 +269,11 @@ def test_hard_and_soft_wrappers_agree_in_the_narrow_sigma_limit():
     p = _catalogue()
     battrs = BinAttrs(s=edges)
     hard = count2(p, battrs=battrs, mattrs=_mattrs(p, p, battrs))['weight']
+    # softmax: the narrow-sigma limit is exact there; in gaussian mode a width
+    # small against the bin makes the quadrature mass width/(sqrt(2 pi) sigma)
+    # blow up instead of approaching one.
     soft = count2_soft(p, battrs=battrs, mattrs=_mattrs(p, p, battrs),
-                       soft_sigma=1e-3, soft_accum=ACC)['weight']
+                       soft_sigma=1e-3, soft_accum=ACC, soft_norm='softmax')['weight']
     got, want = _counts(soft), _counts(hard)
     np.testing.assert_allclose(got, want, rtol=1e-10, atol=1e-10 * np.abs(want).max())
 

@@ -61,20 +61,24 @@ def _setup(seed=7, n=N, weighted=True):
     return pos1, pos2, w1, w2, battrs, mattrs
 
 
-def _reference_counts(pos1, pos2, w1, w2, battrs, mattrs, sigma=SIGMA):
+def _reference_counts(pos1, pos2, w1, w2, battrs, mattrs, sigma=SIGMA,
+                      soft_norm='gaussian'):
     p1 = Particles(np.asarray(pos1), None if w1 is None else np.asarray(w1))
     p2 = Particles(np.asarray(pos2), None if w2 is None else np.asarray(w2))
     return nsoft.count2_soft(p1, p2, battrs=battrs, soft_sigma=sigma, soft_cutoff=CUTOFF,
-                             mattrs=mattrs, backend='cuda', soft_accum=ACC)['weight']
+                             mattrs=mattrs, backend='cuda', soft_accum=ACC,
+                             soft_norm=soft_norm)['weight']
 
 
-def _jax_counts(pos1, w1, pos2, w2, battrs, mattrs, sigma=SIGMA):
+def _jax_counts(pos1, w1, pos2, w2, battrs, mattrs, sigma=SIGMA,
+                soft_norm='gaussian'):
     # mattrs is passed explicitly: MeshAttrs cannot infer box extents from traced
     # positions, the same restriction as cjax.count2.
     p1 = cjax.Particles(pos1, w1)
     p2 = cjax.Particles(pos2, w2)
     return cjax.count2_soft(p1, p2, battrs=battrs, soft_sigma=sigma, soft_cutoff=CUTOFF,
-                            mattrs=mattrs, backend='cuda', soft_accum=ACC)['weight']
+                            mattrs=mattrs, backend='cuda', soft_accum=ACC,
+                            soft_norm=soft_norm)['weight']
 
 
 @needs_soft_jax
@@ -325,9 +329,10 @@ def test_float32_accumulation_is_the_default_and_matches_numpy():
 def test_soft_mu_multipoles_match_the_numpy_frontend():
     """A pole axis is soft-binned in mu too, and the FFI carries its slot count.
 
-    The output is ``(nbins, nell)``; ``M_0 == 1`` makes the monopole column equal
-    the soft-s counts, which is the cheapest check that the extra axis is wired
-    through rather than dropped or transposed.
+    The output is ``(nbins, nell)``; ``M_0 == 1`` (the mu axis is always
+    renormalised) makes the monopole column equal the soft-s counts, which is the
+    cheapest check that the extra axis is wired through rather than dropped or
+    transposed.
     """
     ells = np.array([0, 2, 4])
     rng = np.random.default_rng(61)
@@ -342,13 +347,17 @@ def test_soft_mu_multipoles_match_the_numpy_frontend():
     ma_s = MeshAttrs(p1, p2, boxsize=BOX, battrs=ba_s, periodic=True)
     ma_mu = MeshAttrs(p1, p2, boxsize=BOX, battrs=ba_mu, periodic=True)
 
-    expected = np.asarray(_reference_counts(pos1, pos2, w1, w2, ba_mu, ma_mu))
-    got = np.asarray(_jax_counts(pos1, w1, pos2, w2, ba_mu, ma_mu))
-    assert got.shape == expected.shape == (EDGES.size - 1, ells.size)
-    np.testing.assert_allclose(got, expected, rtol=1e-12, atol=1e-12)
+    for norm in ('gaussian', 'softmax'):
+        expected = np.asarray(_reference_counts(pos1, pos2, w1, w2, ba_mu, ma_mu,
+                                                soft_norm=norm))
+        got = np.asarray(_jax_counts(pos1, w1, pos2, w2, ba_mu, ma_mu, soft_norm=norm))
+        assert got.shape == expected.shape == (EDGES.size - 1, ells.size)
+        np.testing.assert_allclose(got, expected, rtol=1e-12, atol=1e-12)
 
-    iso = np.asarray(_jax_counts(pos1, w1, pos2, w2, ba_s, ma_s))
-    np.testing.assert_allclose(got[:, 0], iso, rtol=1e-14, atol=1e-14)
+        # The mu axis is renormalised whatever soft_norm does to the s axis, so
+        # M_0 = 1 and the ell = 0 column is the isotropic soft count exactly.
+        iso = np.asarray(_jax_counts(pos1, w1, pos2, w2, ba_s, ma_s, soft_norm=norm))
+        np.testing.assert_allclose(got[:, 0], iso, rtol=1e-14, atol=1e-14)
 
 
 @needs_soft_jax

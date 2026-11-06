@@ -543,6 +543,7 @@ py::dict soft_meta(const SoftBinSpec &spec)
     soft["accum"] = "float64";  // the accumulator is double, always
     soft["cutoff"] = spec.cutoff;
     soft["kmax"] = spec.kmax;
+    soft["norm"] = spec.norm_softmax ? "softmax" : "gaussian";
     // Only the uniform path has a fixed window length; the general path expands
     // until the cutoff stops it, so its tap count depends on the pair.
     soft["taps"] = spec.uniform ? 2 * spec.kmax + 1 : -1;
@@ -603,7 +604,8 @@ std::vector<double> soft_mu_edges_from_py(const py::object &obj)
 SoftBinSpec soft_spec_from_py(const BinAttrs &battrs, const WeightAttrs &wattrs,
                              const SplitAttrs &spattrs, const MeshAttrs &mattrs,
                              const py::object &sigma_obj, double cutoff,
-                             const std::string &taps, const py::object &mu_sigma_obj,
+                             const std::string &taps, const std::string &norm,
+                             const py::object &mu_sigma_obj,
                              int mu_bins, const std::vector<double> &mu_edges,
                              size_t *csize)
 {
@@ -623,7 +625,7 @@ SoftBinSpec soft_spec_from_py(const BinAttrs &battrs, const WeightAttrs &wattrs,
     return make_soft_bin_spec(battrs, wattrs, spattrs, sigma, cutoff, csize, mu_sigma,
                               mu_bins, mu_edges.empty() ? nullptr : mu_edges.data(),
                               static_cast<int>(mu_edges.size()),
-                              /*acc_float=*/0, /*backend=*/"cpu");
+                              /*acc_float=*/0, /*backend=*/"cpu", norm.c_str());
 }
 
 
@@ -636,6 +638,7 @@ py::object count2_soft_py(Particles_py& particles1, Particles_py& particles2,
                           const double soft_cutoff,
                           const std::string& soft_taps,
                           const std::string& soft_accum,
+                          const std::string& soft_norm,
                           const py::object& soft_mu_sigma_obj,
                           const int soft_mu_bins,
                           const py::object& soft_mu_edges_obj,
@@ -658,8 +661,9 @@ py::object count2_soft_py(Particles_py& particles1, Particles_py& particles2,
     const std::vector<double> mu_edges = soft_mu_edges_from_py(soft_mu_edges_obj);
     size_t csize = 0;
     SoftBinSpec spec = soft_spec_from_py(battrs, wattrs, spattrs, mattrs, soft_sigma_obj,
-                                        soft_cutoff, soft_taps, soft_mu_sigma_obj,
-                                        soft_mu_bins, mu_edges, &csize);
+                                        soft_cutoff, soft_taps, soft_norm,
+                                        soft_mu_sigma_obj, soft_mu_bins, mu_edges,
+                                        &csize);
 
     Particles p1 = particles1.data();
     Particles p2 = particles2.data();
@@ -715,6 +719,7 @@ py::object count2_soft_vjp_py(Particles_py& particles1, Particles_py& particles2
                               const double soft_cutoff,
                               const std::string& soft_taps,
                               const std::string& soft_accum,
+                              const std::string& soft_norm,
                               const py::object& soft_mu_sigma_obj,
                               const int soft_mu_bins,
                               const py::object& soft_mu_edges_obj,
@@ -735,8 +740,9 @@ py::object count2_soft_vjp_py(Particles_py& particles1, Particles_py& particles2
     const std::vector<double> mu_edges = soft_mu_edges_from_py(soft_mu_edges_obj);
     size_t csize = 0;
     SoftBinSpec spec = soft_spec_from_py(battrs, wattrs, spattrs, mattrs, soft_sigma_obj,
-                                        soft_cutoff, soft_taps, soft_mu_sigma_obj,
-                                        soft_mu_bins, mu_edges, &csize);
+                                        soft_cutoff, soft_taps, soft_norm,
+                                        soft_mu_sigma_obj, soft_mu_bins, mu_edges,
+                                        &csize);
 
     Particles p1 = particles1.data();
     Particles p2 = particles2.data();
@@ -838,12 +844,13 @@ PYBIND11_MODULE(cpu, m, py::mod_gil_not_used()) {
           py::arg("soft_cutoff") = 1e-13,
           py::arg("soft_taps") = "exact",
           py::arg("soft_accum") = "float32",
+          py::arg("soft_norm") = "gaussian",
           py::arg("soft_mu_sigma") = py::none(),
           py::arg("soft_mu_bins") = 0,
           py::arg("soft_mu_edges") = py::none(),
           py::arg("nthreads") = 1,
           py::arg("return_timings") = false,
-          "Pair counts with Gaussian-softmax soft binning on the separation\n"
+          "Pair counts with Gaussian soft binning on the separation\n"
           "axis, same signature and result dict as cucountlib.cuda.count2_soft.\n"
           "Every pair is visited once per thread-private histogram and the\n"
           "histograms are reduced at the end, so the accumulator is double:\n"
@@ -859,6 +866,7 @@ PYBIND11_MODULE(cpu, m, py::mod_gil_not_used()) {
           py::arg("soft_cutoff") = 1e-13,
           py::arg("soft_taps") = "exact",
           py::arg("soft_accum") = "float32",
+          py::arg("soft_norm") = "gaussian",
           py::arg("soft_mu_sigma") = py::none(),
           py::arg("soft_mu_bins") = 0,
           py::arg("soft_mu_edges") = py::none(),

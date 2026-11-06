@@ -61,6 +61,27 @@ __device__ __forceinline__ void soft_increment(ACC *p, ACC v)
 }
 
 
+// Quadrature prefactor of the plain-Gaussian mode, per bin:
+//
+//   A_b = (edges[b+1] - edges[b]) / (sqrt(2 pi) sigma_b),
+//
+// which turns exp(-x_b) into a discrete probability mass. Constant for a
+// uniform grid and for a width-scaled sigma; only a non-uniform grid with one
+// absolute sigma needs the local width. Softmax never calls this.
+__device__ __forceinline__ FLOAT soft_s_quadrature_norm(
+    const SoftBinSpec &sp,
+    const int bin)
+{
+    if (sp.s_kernel_norm > 0) {
+        return sp.s_kernel_norm;
+    }
+
+    // Precomputed on the host: a double sqrt per tap costs far more than the
+    // pass this mode is meant to save.
+    return sp.quad_norm[bin];
+}
+
+
 // `stride` is the histogram stride between neighbouring s bins: 1 for a plain
 // soft-s request, nell when the multipoles are folded into `hist` (see
 // soft_add_pole below, which calls this once per multipole on hist + ill).
@@ -97,6 +118,56 @@ __device__ __forceinline__ void soft_add_uniform(
     const FLOAT rup = exp(md);
     const FLOAT rdn = (rup > 0) ? sp.iq / rup : exp(-md - sp.gg);
     const int kmax = sp.kmax;
+
+    // Plain normalised Gaussian: one pass, W_b = A_b exp(-x_b). The recurrence
+    // ratios are relative to the peak bin, so exp(-x_m) is restored here.
+    if (sp.norm_softmax == 0) {
+        const FLOAT scale =
+            w * exp(-u * u * sp.inv2sig2) * soft_s_quadrature_norm(sp, m);
+
+        if (m >= kmax && m + kmax < sp.nbins) {
+            soft_increment<ACC, ATOMIC>(&hist[m * stride], scale);
+
+            FLOAT wu = 1, ru = rup, wd = 1, rd = rdn;
+
+            for (int t = 1; t <= kmax; ++t) {
+                wu *= ru;
+                ru *= sp.iq;
+                wd *= rd;
+                rd *= sp.iq;
+                soft_increment<ACC, ATOMIC>(&hist[(m + t) * stride], scale * wu);
+                soft_increment<ACC, ATOMIC>(&hist[(m - t) * stride], scale * wd);
+            }
+
+            return;
+        }
+
+        soft_increment<ACC, ATOMIC>(&hist[m * stride], scale);
+
+        FLOAT wu = 1, ru = rup, wd = 1, rd = rdn;
+        bool oku = true, okd = true;
+
+        for (int t = 1; t <= kmax; ++t) {
+            wu *= ru;
+            ru *= sp.iq;
+            wd *= rd;
+            rd *= sp.iq;
+
+            oku = (m + t < sp.nbins) && (wu > sp.cutoff);
+            okd = (m - t >= 0) && (wd > sp.cutoff);
+
+            if (oku) {
+                soft_increment<ACC, ATOMIC>(&hist[(m + t) * stride], scale * wu);
+            }
+            if (okd) {
+                soft_increment<ACC, ATOMIC>(&hist[(m - t) * stride], scale * wd);
+            }
+            if (!oku && !okd) {
+                break;
+            }
+        }
+        return;
+    }
 
     // Fast path: when the whole window is interior, no tap can leave [0, nbins)
     // and every tap inside kmax is above the cutoff by construction, so the two
@@ -324,6 +395,32 @@ __device__ __forceinline__ void soft_add_general(
     const SoftWindow win = soft_general_window(sp, s);
     const int m = win.m;
 
+    // Plain normalised Gaussian: the window offsets are logits relative to the
+    // peak, so exp(-lmin) restores the absolute Gaussian, one pass over taps.
+    if (sp.norm_softmax == 0) {
+        const FLOAT peak = exp(-win.lmin);
+
+        soft_increment<ACC, ATOMIC>(
+            &hist[m * stride], w * peak * soft_s_quadrature_norm(sp, m));
+
+        for (int k = 1; k <= win.up; ++k) {
+            const FLOAT dd = s - cen[m + k];
+            soft_increment<ACC, ATOMIC>(
+                &hist[(m + k) * stride],
+                w * peak * soft_s_quadrature_norm(sp, m + k) *
+                    soft_tap_weight(dd * dd * i2s2[m + k] - win.lmin, fast));
+        }
+
+        for (int k = 1; k <= win.dn; ++k) {
+            const FLOAT dd = s - cen[m - k];
+            soft_increment<ACC, ATOMIC>(
+                &hist[(m - k) * stride],
+                w * peak * soft_s_quadrature_norm(sp, m - k) *
+                    soft_tap_weight(dd * dd * i2s2[m - k] - win.lmin, fast));
+        }
+        return;
+    }
+
     // Pass 1: the normaliser. The peak's weight is exp(0) = 1.
     FLOAT sum = 1;
 
@@ -382,7 +479,7 @@ __device__ __forceinline__ void soft_add(
 // Multipole axis: soft mu binning
 // ============================================================================
 //
-// mu is softened with the same truncated Gaussian softmax, on a uniform grid of
+// mu is softened with the same Gaussian kernel (and the same `soft_norm`), on a uniform grid of
 // nmu centres over [-1, 1] (the interval mu already lives in, so the grid needs
 // no range search: the nearest centre is arithmetic). What the pair then
 // accumulates is *not* a histogram in mu but the multipoles,
@@ -423,7 +520,8 @@ __device__ __forceinline__ void soft_legendre_all(
 }
 
 
-// The truncated softmax over the mu grid folded onto the multipoles. DERIV also
+// The truncated softmax over the mu grid folded onto the multipoles (the
+// legacy soft_norm='softmax' path). DERIV also
 // returns the derivative of the profile with respect to mu, which is what the
 // adjoint needs:
 //
@@ -538,9 +636,11 @@ __device__ __forceinline__ void soft_mu_profile_uniform(
 
 // The same profile on a caller-supplied (non-arithmetic) mu grid. There is no
 // multiplicative recurrence across unequal cells, so the window is expanded cell
-// by cell and each tap pays one exp; the tap set is still the truncated softmax
-// (every cell whose weight is above the cutoff), and the derivative keeps the
-// same form with the tap's own sigma:
+// by cell and each tap pays one exp; the tap set is every cell whose weight is
+// above the cutoff. mu is renormalised over that window whatever soft_norm says
+// about the separation axis -- mu is bounded to [-1, 1], so an un-renormalised
+// kernel straddling a pole would lose nearly half its mass -- and the derivative
+// keeps the same form with the tap's own sigma:
 //
 //   dWmu_j/dmu = Wmu_j (c_j - mu) / sigma_j^2.
 template <bool DERIV>
@@ -634,6 +734,13 @@ __device__ __forceinline__ void soft_mu_profile_general(
 
 // Dispatch: the arithmetic grid keeps the two-exp recurrence, anything else the
 // per-tap window. Both fill the same M/dM contract.
+//
+// The mu axis is *always* renormalised, whatever `soft_norm` says about the
+// separation axis: mu = s_parallel / s lives in [-1, 1], a bounded domain, so a
+// kernel straddling a pole would otherwise lose up to half its mass there
+// (M_0 ~ 0.5 for a pair within a sigma of |mu| = 1).  Renormalising is what
+// makes smoothing a distribution on that domain well defined, and it keeps
+// M_0 == 1 so the monopole *is* the isotropic soft count.
 template <bool DERIV>
 __device__ __forceinline__ void soft_mu_profile(
     const SoftBinSpec &sp,
@@ -1040,10 +1147,10 @@ static void upload_soft_tables(SoftBinSpec &spec, DeviceMemoryBuffer *buffer,
     // so the CPU and the CUDA backend cannot disagree about the centres, the
     // per-bin sigma or the edges of a caller-supplied grid; all this function owns
     // is the device copies and their lifetime.
-    std::vector<FLOAT> s_centres, s_inv2s2, s_edges;
+    std::vector<FLOAT> s_centres, s_inv2s2, s_edges, s_quad_norm;
     std::vector<FLOAT> mu_centres, mu_inv2s2, mu_edges;
 
-    soft_build_host_tables(spec, s_centres, s_inv2s2, s_edges,
+    soft_build_host_tables(spec, s_centres, s_inv2s2, s_edges, s_quad_norm,
                            mu_centres, mu_inv2s2, mu_edges);
 
     auto upload = [&](const std::vector<FLOAT> &h) -> FLOAT * {
@@ -1058,6 +1165,10 @@ static void upload_soft_tables(SoftBinSpec &spec, DeviceMemoryBuffer *buffer,
         spec.centres = upload(s_centres);
         spec.inv2s2 = upload(s_inv2s2);
         spec.edges = upload(s_edges);
+    }
+
+    if (!s_quad_norm.empty()) {
+        spec.quad_norm = upload(s_quad_norm);
     }
 
     if (!mu_centres.empty()) {
@@ -1274,9 +1385,10 @@ void soft_cast_f64_to_f32(float *dst, const FLOAT *src, size_t n,
 // ============================================================================
 //
 // The forward is a scatter of one pair weight into a Gaussian window, so the
-// adjoint is a gather of the histogram cotangent over the same window. Writing
-// the softmax out (c_b centres, W_b = e_b / sum, cbar/xbar the W-means of the
-// centres and logits):
+// adjoint is a gather of the histogram cotangent over the same window. The
+// formulas below are the legacy soft_norm='softmax' ones, with the softmax
+// written out (c_b centres, W_b = e_b / sum, cbar/xbar the W-means of the
+// centres and logits); the plain-Gaussian variants drop the normaliser terms:
 //
 //   dL/dw_pair = sum_b g_b W_b
 //   dL/ds      = (w_pair / sigma^2) sum_b g_b W_b (c_b - cbar)
@@ -1505,6 +1617,163 @@ __device__ __forceinline__ void soft_vjp_pair_general(
 }
 
 
+// Plain-Gaussian adjoint: no normaliser to differentiate, so the per-pair
+// reduction is
+//
+//   dL/dw      = sum_b g_b W_b
+//   dL/ds      = -2 w sum_b g_b W_b (s - c_b) / (2 sigma_b^2)
+//   dL/dsigma  = (w / sigma) sum_b g_b W_b (2 x_b - 1)
+//
+// with x_b = (s - c_b)^2 / (2 sigma_b^2) and the prefactor's own 1/sigma
+// derivative folded into the dsigma line.
+__device__ __forceinline__ void soft_vjp_pair_uniform_gaussian(
+    const FLOAT *g,
+    const SoftBinSpec &sp,
+    FLOAT s,
+    FLOAT w,
+    SoftVjpPair *out)
+{
+    out->dw = 0;
+    out->ds = 0;
+    out->dsigma = 0;
+    out->dmu = 0;
+
+    if (!(s >= sp.lo) || !(s < sp.hi)) {
+        return;
+    }
+
+    int m = (int) floor((s - sp.c0) * sp.inv_ds + 0.5);
+
+    if (m < 0) {
+        m = 0;
+    }
+    else if (m >= sp.nbins) {
+        m = sp.nbins - 1;
+    }
+
+    const FLOAT u = s - (sp.c0 + m * sp.ds);
+    const FLOAT md = (2 * u - sp.ds) * sp.ds * sp.inv2sig2;
+    const FLOAT rup = exp(md);
+    const FLOAT rdn = (rup > 0) ? sp.iq / rup : exp(-md - sp.gg);
+    const int kmax = sp.kmax;
+    const FLOAT peak = exp(-u * u * sp.inv2sig2);
+
+    FLOAT dw = 0;
+    FLOAT first_moment = 0;
+    FLOAT logit_moment = 0;
+
+#define CUCOUNT_SOFT_VJP_UNI_G_TAP(B, RW)                          \
+    do {                                                           \
+        const FLOAT c_ = sp.c0 + (B) * sp.ds;                      \
+        const FLOAT d_ = s - c_;                                   \
+        const FLOAT x_ = d_ * d_ * sp.inv2sig2;                    \
+        const FLOAT w_ = peak * soft_s_quadrature_norm(sp, B) * (RW); \
+        const FLOAT g_ = g[B];                                     \
+        dw += w_ * g_;                                             \
+        first_moment += w_ * g_ * d_;                              \
+        logit_moment += w_ * g_ * x_;                              \
+    } while (0)
+
+    CUCOUNT_SOFT_VJP_UNI_G_TAP(m, 1);
+
+    FLOAT wu = 1, ru = rup;
+    FLOAT wd = 1, rd = rdn;
+
+    for (int t = 1; t <= kmax; ++t) {
+        wu *= ru;
+        ru *= sp.iq;
+        wd *= rd;
+        rd *= sp.iq;
+
+        const bool oku = (m + t < sp.nbins) && (wu > sp.cutoff);
+        const bool okd = (m - t >= 0) && (wd > sp.cutoff);
+
+        if (oku) {
+            CUCOUNT_SOFT_VJP_UNI_G_TAP(m + t, wu);
+        }
+        if (okd) {
+            CUCOUNT_SOFT_VJP_UNI_G_TAP(m - t, wd);
+        }
+        if (!oku && !okd) {
+            break;
+        }
+    }
+
+#undef CUCOUNT_SOFT_VJP_UNI_G_TAP
+
+    out->dw = dw;
+    out->ds = -2 * w * sp.inv2sig2 * first_moment;
+    out->dsigma = w * sp.inv_sigma * (2 * logit_moment - dw);
+}
+
+
+// General-grid counterpart: the same quadrature weights, one exp per tap, and
+// the local 1/sigma_b^2 carried explicitly because it is not constant.
+__device__ __forceinline__ void soft_vjp_pair_general_gaussian(
+    const FLOAT *g,
+    const SoftBinSpec &sp,
+    FLOAT s,
+    FLOAT w,
+    SoftVjpPair *out)
+{
+    out->dw = 0;
+    out->ds = 0;
+    out->dsigma = 0;
+    out->dmu = 0;
+
+    if (!(s >= sp.lo) || !(s < sp.hi)) {
+        return;
+    }
+
+    const FLOAT *cen = sp.centres;
+    const FLOAT *i2s2 = sp.inv2s2;
+    const bool fast = sp.fast_taps != 0;
+    const SoftWindow win = soft_general_window(sp, s);
+    const int m = win.m;
+    const FLOAT peak = exp(-win.lmin);
+
+    FLOAT dw = 0;
+    FLOAT first_moment = 0;
+    FLOAT logit_moment = 0;
+
+#define CUCOUNT_SOFT_VJP_GEN_G_TAP(B, RW)                           \
+    do {                                                            \
+        const FLOAT c_ = cen[B];                                    \
+        const FLOAT d_ = s - c_;                                    \
+        const FLOAT i2_ = i2s2[B];                                  \
+        const FLOAT x_ = d_ * d_ * i2_;                             \
+        const FLOAT w_ = peak * soft_s_quadrature_norm(sp, B) * (RW); \
+        const FLOAT g_ = g[B];                                      \
+        dw += w_ * g_;                                              \
+        first_moment += w_ * g_ * d_ * i2_;                         \
+        logit_moment += w_ * g_ * x_;                               \
+    } while (0)
+
+    CUCOUNT_SOFT_VJP_GEN_G_TAP(m, 1);
+
+    for (int k = 1; k <= win.up; ++k) {
+        const FLOAT dd = s - cen[m + k];
+        CUCOUNT_SOFT_VJP_GEN_G_TAP(
+            m + k, soft_tap_weight(dd * dd * i2s2[m + k] - win.lmin, fast));
+    }
+
+    for (int k = 1; k <= win.dn; ++k) {
+        const FLOAT dd = s - cen[m - k];
+        CUCOUNT_SOFT_VJP_GEN_G_TAP(
+            m - k, soft_tap_weight(dd * dd * i2s2[m - k] - win.lmin, fast));
+    }
+
+#undef CUCOUNT_SOFT_VJP_GEN_G_TAP
+
+    out->dw = dw;
+    out->ds = -2 * w * first_moment;
+
+    if (!sp.per_bin_sigma) {
+        out->dsigma = w * sp.inv_sigma * (2 * logit_moment - dw);
+    }
+}
+
+
 // The line of sight as a unit vector plus the two coefficients that carry its
 // own dependence on the endpoints. mu = (diff . lhat) / s, so
 //
@@ -1584,6 +1853,161 @@ __device__ __forceinline__ void soft_mu_line_of_sight(
 }
 
 
+// Plain-Gaussian multipole adjoint. The s weights are no longer normalised, so
+// the s gradient is the direct sum over the window rather than a mean-subtracted
+// one, and there is no dsigma term (the mu profile has no sigma of its own here).
+__device__ __forceinline__ void soft_vjp_pair_pole_gaussian(
+    const FLOAT *g,
+    const SoftBinSpec &sp,
+    FLOAT s,
+    FLOAT mu,
+    FLOAT w,
+    SoftVjpPair *out)
+{
+    out->dw = 0;
+    out->ds = 0;
+    out->dsigma = 0;
+    out->dmu = 0;
+
+    if (!(s >= sp.lo) || !(s < sp.hi)) {
+        return;
+    }
+
+    FLOAT M[CUCOUNT_SOFT_MAXELL], dM[CUCOUNT_SOFT_MAXELL];
+
+    soft_mu_profile<true>(sp, mu, M, dM);
+
+    const int nell = sp.nell;
+
+    FLOAT Bl[CUCOUNT_SOFT_MAXELL];
+    FLOAT tcg_l[CUCOUNT_SOFT_MAXELL];
+    FLOAT T_l[CUCOUNT_SOFT_MAXELL];
+
+    for (int ill = 0; ill < nell; ++ill) {
+        Bl[ill] = 0;
+        tcg_l[ill] = 0;
+        T_l[ill] = 0;
+    }
+
+    if (sp.uniform) {
+        int m = (int) floor((s - sp.c0) * sp.inv_ds + 0.5);
+
+        if (m < 0) {
+            m = 0;
+        }
+        else if (m >= sp.nbins) {
+            m = sp.nbins - 1;
+        }
+
+        const FLOAT u = s - (sp.c0 + m * sp.ds);
+        const FLOAT md = (2 * u - sp.ds) * sp.ds * sp.inv2sig2;
+        const FLOAT rup = exp(md);
+        const FLOAT rdn = (rup > 0) ? sp.iq / rup : exp(-md - sp.gg);
+        const int kmax = sp.kmax;
+        const FLOAT peak = exp(-u * u * sp.inv2sig2);
+
+#define CUCOUNT_SOFT_VJP_POLE_G_UNI_TAP(B, RW)                                 \
+        do {                                                                   \
+            const FLOAT c_ = sp.c0 + (B) * sp.ds;                              \
+            const FLOAT d_ = s - c_;                                           \
+            const FLOAT w_ = (RW) * peak * soft_s_quadrature_norm(sp, B);      \
+            const FLOAT *g_ = &g[(size_t) (B) * nell];                         \
+                                                                               \
+            for (int ill = 0; ill < nell; ++ill) {                             \
+                Bl[ill] += w_ * g_[ill];                                       \
+                tcg_l[ill] += w_ * g_[ill] * c_;                               \
+                T_l[ill] += w_ * g_[ill] * (-d_) * sp.inv2sig2;                \
+            }                                                                  \
+        } while (0)
+
+        CUCOUNT_SOFT_VJP_POLE_G_UNI_TAP(m, 1);
+
+        FLOAT wu = 1, ru = rup;
+        FLOAT wd = 1, rd = rdn;
+
+        for (int t = 1; t <= kmax; ++t) {
+            wu *= ru;
+            ru *= sp.iq;
+            wd *= rd;
+            rd *= sp.iq;
+
+            const bool oku = (m + t < sp.nbins) && (wu > sp.cutoff);
+            const bool okd = (m - t >= 0) && (wd > sp.cutoff);
+
+            if (oku) {
+                CUCOUNT_SOFT_VJP_POLE_G_UNI_TAP(m + t, wu);
+            }
+            if (okd) {
+                CUCOUNT_SOFT_VJP_POLE_G_UNI_TAP(m - t, wd);
+            }
+            if (!oku && !okd) {
+                break;
+            }
+        }
+
+#undef CUCOUNT_SOFT_VJP_POLE_G_UNI_TAP
+    }
+    else {
+        const FLOAT *cen = sp.centres;
+        const FLOAT *i2s2 = sp.inv2s2;
+        const bool fast = sp.fast_taps != 0;
+        const SoftWindow win = soft_general_window(sp, s);
+        const int m = win.m;
+        const FLOAT peak = exp(-win.lmin);
+
+#define CUCOUNT_SOFT_VJP_POLE_G_GEN_TAP(B, RW)                                 \
+        do {                                                                   \
+            const FLOAT c_ = cen[B];                                           \
+            const FLOAT i2_ = i2s2[B];                                         \
+            const FLOAT w_ = (RW) * peak * soft_s_quadrature_norm(sp, B);      \
+            const FLOAT *g_ = &g[(size_t) (B) * nell];                         \
+                                                                               \
+            for (int ill = 0; ill < nell; ++ill) {                             \
+                Bl[ill] += w_ * g_[ill];                                       \
+                tcg_l[ill] += w_ * g_[ill] * c_;                               \
+                T_l[ill] += w_ * g_[ill] * (c_ - s) * i2_;                     \
+            }                                                                  \
+        } while (0)
+
+        CUCOUNT_SOFT_VJP_POLE_G_GEN_TAP(m, 1);
+
+        for (int k = 1; k <= win.up; ++k) {
+            const FLOAT dd = s - cen[m + k];
+            CUCOUNT_SOFT_VJP_POLE_G_GEN_TAP(
+                m + k, soft_tap_weight(dd * dd * i2s2[m + k] - win.lmin, fast));
+        }
+
+        for (int k = 1; k <= win.dn; ++k) {
+            const FLOAT dd = s - cen[m - k];
+            CUCOUNT_SOFT_VJP_POLE_G_GEN_TAP(
+                m - k, soft_tap_weight(dd * dd * i2s2[m - k] - win.lmin, fast));
+        }
+
+#undef CUCOUNT_SOFT_VJP_POLE_G_GEN_TAP
+    }
+
+    FLOAT A = 0;
+    FLOAT tcg = 0;
+    FLOAT T = 0;
+
+    for (int ill = 0; ill < nell; ++ill) {
+        A += M[ill] * Bl[ill];
+        tcg += M[ill] * tcg_l[ill];
+        T += M[ill] * T_l[ill];
+        out->dmu += w * Bl[ill] * dM[ill];
+    }
+
+    out->dw = A;
+
+    if (sp.uniform) {
+        out->ds = w * 2 * sp.inv2sig2 * (tcg - s * A);
+    }
+    else {
+        out->ds = 2 * w * T;
+    }
+}
+
+
 // Adjoint of a pair counted with soft mu binning. The multipole profile is
 // gathered through the same truncated mu window the forward used, and the
 // cotangent is contracted with it in two directions at once:
@@ -1609,6 +2033,11 @@ __device__ __forceinline__ void soft_vjp_pair_pole(
     out->dmu = 0;
 
     if (!(s >= sp.lo) || !(s < sp.hi)) {
+        return;
+    }
+
+    if (sp.norm_softmax == 0) {
+        soft_vjp_pair_pole_gaussian(g, sp, s, mu, w, out);
         return;
     }
 
@@ -1822,10 +2251,20 @@ __device__ __forceinline__ void soft_vjp_pair(
         soft_vjp_pair_pole(g, sp, s, mu, w, out);
     }
     else if (sp.uniform) {
-        soft_vjp_pair_uniform(g, sp, s, w, out);
+        if (sp.norm_softmax) {
+            soft_vjp_pair_uniform(g, sp, s, w, out);
+        }
+        else {
+            soft_vjp_pair_uniform_gaussian(g, sp, s, w, out);
+        }
     }
     else {
-        soft_vjp_pair_general(g, sp, s, w, out);
+        if (sp.norm_softmax) {
+            soft_vjp_pair_general(g, sp, s, w, out);
+        }
+        else {
+            soft_vjp_pair_general_gaussian(g, sp, s, w, out);
+        }
     }
 }
 

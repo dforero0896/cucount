@@ -1,16 +1,16 @@
 """Correctness of the soft mu binning (differentiable multipoles).
 
-The mu axis is softened with the same Gaussian-softmax construction as s, but it
-is not histogrammed: each pair deposits ``w_pair * Ws_i * M_l(mu)`` in slot
-``(i, l)``, where ``M_l`` is the truncated softmax over a uniform mu grid folded
-onto ``(2l+1) P_l`` of the grid *centres*. These tests pin that definition down
-independently of the kernel:
+The mu axis is softened with the same Gaussian kernel as s, but it is not
+histogrammed: each pair deposits ``w_pair * Ws_i * M_l(mu)`` in slot ``(i, l)``,
+where ``M_l`` folds the mu-grid weights onto ``(2l+1) P_l`` of the grid
+*centres*. These tests pin that definition down independently of the kernel:
 
 * a numpy O(N^2) reference builds ``M_l`` from ``soft_mu_weights`` and the
   separation weights from ``soft_weights``, so forward agreement is a real check
   and not two implementations sharing a formula;
 * the ``l = 0`` slot must equal the soft-s counts exactly (``M_0 = 1`` by
-  construction), which catches a mu profile that does not sum to one;
+  construction: the mu axis is always renormalised), which catches a mu profile
+  that does not sum to one;
 * ``sigma_mu -> 0`` must approach the *hard* multipoles of ``count2`` as the mu
   quadrature is refined;
 * the analytic adjoint is checked against central differences of the forward,
@@ -27,7 +27,7 @@ from cucount.numpy import (count2, count2_soft as _count2_soft,
                            mu_kmax, mu_spec, soft_mu_weights, soft_weights)
 
 
-# Pin the unpadded estimator: the references here describe the softmax over the
+# Pin the unpadded estimator: the references here describe the kernel over the
 # real bins only.  test_soft_pad.py covers edge padding.
 def count2_soft(*args, **kwargs):
     kwargs.setdefault('soft_pad', 0.0)
@@ -38,7 +38,7 @@ def count2_soft_vjp(*args, **kwargs):
     kwargs.setdefault('soft_pad', 0.0)
     return _count2_soft_vjp(*args, **kwargs)
 
-# The reference tests below check the softmax math, the window and the adjoint
+# The reference tests below check the kernel math, the window and the adjoint
 # against exact references, so they pin the exact accumulator. The default
 # float32 shared-memory tile costs a few 1e-7 relative on the counts (see
 # test_soft_s_cuda.py::test_float32_accumulation_is_the_default); at 1e-12
@@ -138,13 +138,17 @@ def test_matches_brute_force_with_a_finite_mu_width():
 
 
 @needs_cuda
-def test_monopole_is_the_soft_s_count():
-    """M_0 = 1 exactly, so asking for ell=0 must not change the answer."""
+@pytest.mark.parametrize('norm', ['gaussian', 'softmax'])
+def test_monopole_is_the_soft_s_count(norm):
+    """M_0 = 1 exactly: the mu axis is renormalised whatever soft_norm says."""
     p1, p2, ba, ma = _setup(ells=ELLS, los='z', n1=60, n2=50)
-    soft = count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF, soft_accum=ACC)
+    soft = count2_soft(p1, p2, battrs=ba, mattrs=ma, soft_cutoff=CUTOFF,
+                       soft_accum=ACC, soft_norm=norm)
+    assert soft['soft']['norm'] == norm
     ba_s = BinAttrs(s=EDGES)
     ma_s = MeshAttrs(p1, p2, boxsize=BOX, battrs=ba_s, periodic=True)
-    iso = count2_soft(p1, p2, battrs=ba_s, mattrs=ma_s, soft_cutoff=CUTOFF, soft_accum=ACC)
+    iso = count2_soft(p1, p2, battrs=ba_s, mattrs=ma_s, soft_cutoff=CUTOFF,
+                      soft_accum=ACC, soft_norm=norm)
     ells = [int(e) for e in np.asarray(ba.coords('pole'))]
     i0 = ells.index(0)
     mono = np.asarray(soft['weight'])[:, i0]
@@ -158,9 +162,17 @@ def test_refining_the_mu_grid_approaches_hard_multipoles():
     """sigma_mu -> 0 with a fine grid recovers count2's hard multipoles."""
     ells = np.array([0, 2, 4])
     p1, p2, ba, ma = _setup(ells=ells, los='z', n1=40, n2=35)
+    # This test isolates the *mu* axis, so the separation axis is pinned to the
+    # renormalised mode: with the default gaussian s weights a pair only counts
+    # the kernel mass that lands inside [edges[0], edges[-1]), and with just a
+    # couple of dozen pairs in range the few near the upper edge lose 15-50% of
+    # their weight. That is the documented edge truncation (soft_pad's subject,
+    # covered by test_soft_pad.py and test_soft_s_cuda.py), and here it would
+    # swamp the limit being measured, not test it.
     soft = np.asarray(count2_soft(p1, p2, battrs=ba, mattrs=ma,
                                   soft_cutoff=CUTOFF, soft_mu_sigma=1e-3,
-                                  soft_mu_bins=1024, soft_accum=ACC)['weight'])
+                                  soft_mu_bins=1024, soft_accum=ACC,
+                                  soft_norm='softmax')['weight'])
     hard = np.asarray(count2(p1, p2, battrs=ba, mattrs=ma)['weight'])
     # Per-bin values differ because s is still smoothed: sigma -> 0 is a limit of
     # the *multipole moments*, so the s bins are summed over. The mu profile also

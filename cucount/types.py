@@ -188,6 +188,7 @@ def count2(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttrs=Non
 
 
 def _soft_self_pair_mask(battrs: BinAttrs, soft_sigma=None, soft_cutoff=1e-13,
+                         soft_norm='gaussian',
                          soft_mu_sigma=None, soft_mu_bins=0, soft_mu_edges=None,
                          s_edges=None):
     """The profile an autocorrelation self pair deposits, shape ``counts.shape``.
@@ -195,7 +196,7 @@ def _soft_self_pair_mask(battrs: BinAttrs, soft_sigma=None, soft_cutoff=1e-13,
     The soft counts include the diagonal pairs exactly as the kernel sees them,
     so they must be removed with the same profile. A self pair sits at ``s = 0``
     (the kernel also sets ``mu = 0`` there), so it spreads over the separation
-    bins with the ordinary Gaussian softmax and over the mu quadrature with the
+    bins with the ordinary Gaussian kernel and over the mu quadrature with the
     soft moment profile -- like any other pair, because the kernel does not
     special-case it. The hard wrapper subtracts ``sum_weights2`` from the bin
     that contains zero; the soft wrapper subtracts ``sum_weights2 * this``.
@@ -206,7 +207,8 @@ def _soft_self_pair_mask(battrs: BinAttrs, soft_sigma=None, soft_cutoff=1e-13,
         if name == 'pole':
             ells = np.asarray(edges, dtype=np.int64)
             masks.append(soft_mu_weights(np.array([0.]), ells, soft_mu_sigma,
-                                         soft_mu_bins, soft_cutoff, soft_mu_edges)[0])
+                                         soft_mu_bins, soft_cutoff,
+                                         soft_mu_edges)[0])
         elif name == 's':
             # edges() gives one (low, high) pair per bin; the kernel's window is
             # [low[0], high[-1]), so a grid that excludes zero never counted the
@@ -216,7 +218,8 @@ def _soft_self_pair_mask(battrs: BinAttrs, soft_sigma=None, soft_cutoff=1e-13,
             sedges = (np.asarray(s_edges, dtype=np.float64) if s_edges is not None
                       else np.append(edges[:, 0], edges[-1, 1]))
             inside = sedges[0] <= 0. < sedges[-1]
-            masks.append(soft_weights(0., sedges, sigma=soft_sigma)[0]
+            masks.append(soft_weights(0., sedges, sigma=soft_sigma,
+                                      soft_norm=soft_norm)[0]
                          if inside else np.zeros(sedges.size - 1))
         else:
             raise NotImplementedError(f'soft binning does not serve the {name!r} axis')
@@ -226,11 +229,12 @@ def _soft_self_pair_mask(battrs: BinAttrs, soft_sigma=None, soft_cutoff=1e-13,
 def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttrs=None, norm=None,
                 soft_sigma: float=None, soft_cutoff: float=1e-13, soft_taps: str='exact',
                 soft_accum: str='float32', soft_pad: float=None,
+                soft_norm: str='gaussian',
                 soft_mu_sigma: float=None, soft_mu_bins: int=0, soft_mu_edges=None, **kwargs):
     """
     Perform soft pair counts, exporting to :mod:`lsstypes` format.
 
-    Drop-in neighbour of :func:`count2` for the Gaussian-softmax soft binning:
+    Drop-in neighbour of :func:`count2` for the Gaussian soft binning:
     the counts are spread over the separation bins (and, with a ``pole`` axis,
     over the mu quadrature as soft multipoles) instead of being placed in a
     single bin. Normalization, self-pair removal and the ``Count2`` /
@@ -261,9 +265,10 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
         Gaussian width in separation units; ``None`` means half a bin (half of
         *each* bin on a non-uniform grid).
     soft_cutoff : float, optional
-        Relative weight below which the Gaussian tail is dropped (the window is
-        renormalized, so weight stays conserved). Speed knob: taps grow as
-        ``sqrt(2 ln(1 / cutoff))``. Default ``1e-13``.
+        Relative weight below which the Gaussian tail is dropped. In softmax
+        mode the window is renormalized, so weight stays conserved; in gaussian
+        mode the dropped tail is a small quadrature error. Speed knob: taps grow
+        as ``sqrt(2 ln(1 / cutoff))``. Default ``1e-13``.
     soft_taps : {'exact', 'fast'}
         Only affects a non-uniform ``s`` grid: ``'exact'`` (default) uses double
         ``exp``, ``'fast'`` uses ``__expf`` for ~1e-6 weight accuracy.
@@ -273,13 +278,22 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
         the counts; ``'float64'`` restores the bit-comparable path.
     soft_pad : float, optional
         Edge padding in kernel widths. The kernel has infinite support but the
-        traversal stops at the outermost edges, which biases the last bin high
-        and the first low. ``z`` extends the counting range by ``z`` kernel
-        widths with buffer bins, normalises the softmax over them and then drops
+        traversal stops at the outermost edges, which biases the outermost
+        bins. ``z`` extends the counting range by ``z`` kernel
+        widths with buffer bins, spreads the kernel over them and then drops
         them. ``None`` (default) selects two kernel widths, the pyfcfc default;
         ``0`` restores the previous estimator bit for bit. On a log-spaced grid
         the extension is geometric. In a periodic box it is clamped below
         ``L/2``. The cost is the extra pairs in the buffer shells.
+    soft_norm : {'gaussian', 'softmax'}
+        Normalisation of the separation-axis weights. ``'gaussian'`` (default)
+        uses the discrete-quadrature kernel
+        ``dmui / (sqrt(2 pi) sigma_i) exp(-x_i)``, which needs no per-pair
+        normalisation pass and keeps bins from competing for a pair's weight;
+        ``'softmax'`` renormalises each window so per-pair weight is conserved
+        exactly. The mu axis is always renormalised (``mu`` in ``[-1, 1]`` is a
+        bounded domain), so ``M_0 == 1`` and the monopole is the isotropic
+        soft-s count whatever this selects.
     soft_mu_sigma : float, optional
         Width of the mu kernel when ``battrs`` has a pole axis; ``None`` means
         half a mu cell.
@@ -326,6 +340,7 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
                              soft_sigma=soft_sigma, soft_cutoff=soft_cutoff,
                              soft_taps=soft_taps, soft_accum=soft_accum,
                              soft_pad=soft_pad,
+                             soft_norm=soft_norm,
                              soft_mu_sigma=soft_mu_sigma,
                              soft_mu_bins=soft_mu_bins, soft_mu_edges=soft_mu_edges,
                              **kwargs)
@@ -338,8 +353,8 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
     attrs = dict(wsum=sum_weights1)
     # Keep the soft configuration with the counts: without it a saved
     # correlation cannot be told apart from a hard-binned one.
-    for key in ('sigma', 'sigma_kind', 'accum', 'cutoff', 'kmax', 'multipoles',
-                'pad_lo', 'pad_hi', 'nbins_padded',
+    for key in ('sigma', 'sigma_kind', 'accum', 'norm', 'cutoff', 'kmax',
+                'multipoles', 'pad_lo', 'pad_hi', 'nbins_padded',
                 'mu_sigma', 'mu_bins', 'mu_kmax', 'mu_uniform', 'mu_sigma_kind', 'los'):
         if key in meta:
             attrs[f'soft_{key}'] = meta[key]
@@ -354,6 +369,7 @@ def count2_soft(*particles: Particles, battrs: BinAttrs=None, wattrs: WeightAttr
         nlo = int(meta.get('pad_lo', 0))
         ns = int(np.asarray(battrs.edges('s')).shape[0])
         zero = _soft_self_pair_mask(battrs, soft_sigma=soft_sigma, soft_cutoff=soft_cutoff,
+                                    soft_norm=soft_norm,
                                     soft_mu_sigma=soft_mu_sigma, soft_mu_bins=soft_mu_bins,
                                     soft_mu_edges=soft_mu_edges, s_edges=s_ext)
         if s_ext is not None:

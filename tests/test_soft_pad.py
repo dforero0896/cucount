@@ -1,11 +1,12 @@
 """Edge padding (buffer bins) for soft binning.
 
-The soft kernel spreads every pair with a Gaussian softmax over the bin centres,
-but only pairs inside ``[edges[0], edges[-1])`` are traversed.  The infinite
-Gaussian tail therefore leaves the grid unaccounted for, which biases the last
-band high (and the first low).  ``soft_pad=z`` extends the counting range by
-``z`` kernel widths with *buffer bins* and drops them from the result, exactly
-as ``pyfcfc`` does.
+The soft kernel spreads every pair with a Gaussian over the bin centres, but
+only pairs inside ``[edges[0], edges[-1])`` are traversed.  The kernel tail
+outside the grid is therefore unaccounted for, which biases the outermost bins;
+the sign depends on the normalisation (a softmax redistributes the missing tail
+within the window it keeps).  ``soft_pad=z`` extends the counting range by ``z``
+kernel widths with *buffer bins* and drops them from the result, exactly as
+``pyfcfc`` does.
 
 Most of these tests compare the padded call against the same call on a manually
 extended grid, which is the definition of the feature.  The unpadded estimator
@@ -336,8 +337,11 @@ def test_wrapper_slices_the_padded_self_pair_profile():
     want = count2_soft(p, p, battrs=bae, mattrs=mae, soft_pad=0.0,
                        soft_accum='float64', backend='cpu')['weight'][nlo:nlo + ns]
     want = want - (w ** 2).sum() * zero
+    # The two sides differ only in summation order, and the first bins are
+    # exactly zero in theory: at that scale the leftover is 1e-16, so a pure
+    # relative tolerance would be measuring floating-point noise.
     np.testing.assert_allclose(np.asarray(DD.values('counts')), want,
-                               rtol=1e-12, atol=0.0)
+                               rtol=1e-12, atol=1e-12)
 
 
 @needs_cpu

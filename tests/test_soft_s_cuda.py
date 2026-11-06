@@ -1,4 +1,4 @@
-"""Correctness of the soft (Gaussian-softmax) separation binning.
+"""Correctness of the soft (Gaussian) separation binning.
 
 The soft kernel is an extension beside the hard one, so these tests are
 deliberately independent of the hard count2 machinery they compare against:
@@ -21,13 +21,13 @@ from cucount.numpy import (BinAttrs, MeshAttrs, Particles, SelectionAttrs,
 from cucount.numpy import count2, count2_soft as _count2_soft, default_sigma, soft_weights
 from cucount.numpy.soft import _bin_centres, is_uniform, sigmas
 
-# Pin the unpadded estimator: the references here describe the softmax over the
+# Pin the unpadded estimator: the references here describe the kernel over the
 # real bins only.  test_soft_pad.py covers edge padding.
 def count2_soft(*args, **kwargs):
     kwargs.setdefault('soft_pad', 0.0)
     return _count2_soft(*args, **kwargs)
 
-# The reference tests below check the softmax math, the window and the adjoint
+# The reference tests below check the kernel math, the window and the adjoint
 # against exact references, so they pin the exact accumulator. The default
 # float32 shared-memory tile costs a few 1e-7 relative on the counts (see
 # test_soft_s_cuda.py::test_float32_accumulation_is_the_default); at 1e-12
@@ -55,7 +55,7 @@ def _setup(n=400, seed=5, edges=EDGES, box=BOX, periodic=True):
 
 
 def _brute_soft(p, edges, sigma, box=None):
-    """Ordered-pair reference: minimum-image separation, full-grid softmax."""
+    """Ordered-pair reference: minimum-image separation, full-grid kernel."""
     pos = np.asarray(p.positions)
     w = np.asarray(p.values[0])
     i, j = np.indices((pos.shape[0], pos.shape[0]))
@@ -71,12 +71,21 @@ def _brute_soft(p, edges, sigma, box=None):
 
 @needs_cuda
 def test_conserves_total_weight():
-    """Soft binning smooths a histogram, it does not reweight pairs."""
+    """Softmax conserving exactly; the default quadrature to its own accuracy."""
     p, ba, ma = _setup()
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cuda')['weight']
     soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC)
     assert soft['weight'].shape == hard.shape
-    np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=1e-12)
+    # Gaussian quadrature: one unit of weight per pair only to quadrature
+    # accuracy (~0.5% at the half-bin sigma), and the kernel tail outside the
+    # counted range is dropped as well, so allow a few percent.
+    assert soft['soft']['norm'] == 'gaussian'
+    np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=5e-2)
+
+    sm = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC,
+                     soft_norm='softmax')
+    assert sm['soft']['norm'] == 'softmax'
+    np.testing.assert_allclose(sm['weight'].sum(), hard.sum(), rtol=1e-12)
 
 
 @needs_cuda
@@ -101,25 +110,39 @@ def test_non_periodic_matches_brute_force():
 
 @needs_cuda
 def test_sigma_to_zero_is_hard_binning():
-    """The limit the definition promises: a very narrow kernel is hard binning."""
+    """The limit the definition promises: a very narrow kernel is hard binning.
+
+    This is a softmax-mode property. In gaussian mode the weight of a bin is its
+    quadrature mass ``width * density``, which diverges as sigma -> 0 instead of
+    approaching the containing bin's probability; the gaussian kernel is defined
+    for a sigma comparable to the bin width.
+    """
     p, ba, ma = _setup()
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cuda')['weight']
     soft = count2_soft(p, p, battrs=ba, mattrs=ma,
-                       soft_sigma=1e-6, backend='cuda', soft_accum=ACC)['weight']
+                       soft_sigma=1e-6, backend='cuda', soft_accum=ACC,
+                       soft_norm='softmax')['weight']
     np.testing.assert_allclose(soft, hard, rtol=1e-10, atol=1e-10 * hard.max())
 
 
 @needs_cuda
 def test_cutoff_truncation_is_monotone():
-    """Loosening the cutoff must cost accuracy, and never change the total."""
+    """Loosening the cutoff must cost accuracy, and never change the total.
+
+    Softmax only: its per-pair renormalisation makes the total independent of
+    where the window is cut. The default gaussian mode instead just drops the
+    tail, so its total drifts (by the (small) dropped mass).
+    """
     p, ba, ma = _setup()
     sigma = 2.0
     ref = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=sigma,
-                      soft_cutoff=1e-13, backend='cuda', soft_accum=ACC)['weight']
+                      soft_cutoff=1e-13, backend='cuda', soft_accum=ACC,
+                      soft_norm='softmax')['weight']
     errs = []
     for cutoff in (1e-6, 1e-3):
         got = count2_soft(p, p, battrs=ba, mattrs=ma, soft_sigma=sigma,
-                          soft_cutoff=cutoff, backend='cuda', soft_accum=ACC)
+                          soft_cutoff=cutoff, backend='cuda', soft_accum=ACC,
+                          soft_norm='softmax')
         np.testing.assert_allclose(got['weight'].sum(), ref.sum(), rtol=1e-12)
         errs.append(np.abs(got['weight'] - ref).max())
     assert errs[0] < errs[1] < 1e-2 * ref.max()
@@ -135,13 +158,19 @@ def test_meta_reports_the_configuration_it_ran():
     assert meta['taps'] == 2 * meta['kmax'] + 1
     assert meta['path'] in ('shared', 'global')
     assert meta['nbins'] == EDGES.size - 1
+    assert meta['norm'] == 'gaussian'
+    softmax = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC,
+                          soft_norm='softmax')
+    assert softmax['soft']['norm'] == 'softmax'
+    assert softmax['soft']['sigma'] == pytest.approx(meta['sigma'])
 
 
 @needs_cuda
 def test_bin_grid_of_arange_is_served():
     """BIN_CUSTOM with uniform edges must work: uniformity is what is required."""
     p, ba, ma = _setup(edges=np.arange(1.0, 101.0, 5.0))
-    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC)
+    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', soft_accum=ACC,
+                       soft_norm='softmax')
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cuda')['weight']
     np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=1e-12)
 
@@ -198,7 +227,8 @@ def test_log_grid_conserves_total_weight():
     p, ba, ma = _setup(edges=LOG_EDGES)
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cuda')['weight']
     for kw in ({}, {'soft_sigma': 2.0}, {'soft_taps': 'fast'}):
-        soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', **kw, soft_accum=ACC)
+        soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cuda', **kw,
+                           soft_accum=ACC, soft_norm='softmax')
         np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=1e-12)
 
 
@@ -211,7 +241,7 @@ def test_log_grid_tiny_absolute_sigma_snaps_to_the_nearest_centre():
     it does not: a wide bin's centre can sit far from s while the centre of the
     neighbouring narrow bin is closer, so the pair lands one bin down. That is a
     property of centring a Gaussian on bins of unequal width, not a kernel bug,
-    which is why this compares against the numpy softmax reference rather than
+    which is why this compares against the numpy kernel reference rather than
     against the hard histogram. The width-scaled sigma (the default here) keeps
     the weight in the containing bin because it shrinks with the local width.
     """
@@ -285,12 +315,23 @@ def test_rejects_an_unknown_backend():
         count2_soft(p, p, battrs=ba, mattrs=ma, backend='opencl', soft_accum=ACC)
 
 
-def test_soft_weights_is_a_normalised_softmax():
+def test_soft_weights_is_normalised_per_mode():
     s = np.array([5.0, 50.0, 99.0])
+    # Default gaussian: discrete-quadrature masses, so a row sums to one only
+    # to the quadrature accuracy of the half-bin sigma (~0.5%) and only when the
+    # pair is far enough from the grid edges for the Gaussian tail to fit.
     w = soft_weights(s, EDGES, sigma=2.0)
     assert w.shape == (s.size, EDGES.size - 1)
-    np.testing.assert_allclose(w.sum(axis=1), 1.0, rtol=1e-14)
+    # The quadrature error grows with sigma/width: at the half-bin default it is
+    # ~0.5%, while sigma=2.0 on this ~4.95-wide grid is already ~8%.
+    interior = np.array([45.0, 50.0, 55.0])
+    np.testing.assert_allclose(soft_weights(interior, EDGES).sum(axis=1),
+                               1.0, rtol=2e-2)
     assert (w >= 0).all()
+    # Softmax renormalises the row exactly.
+    ws = soft_weights(s, EDGES, sigma=2.0, soft_norm='softmax')
+    np.testing.assert_allclose(ws.sum(axis=1), 1.0, rtol=1e-14)
+    assert (ws >= 0).all()
     # each row peaks in the bin holding s
     centres = _bin_centres(EDGES)
     np.testing.assert_array_equal(w.argmax(axis=1),

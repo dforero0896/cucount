@@ -3,7 +3,8 @@
 Why padding is needed
 ---------------------
 With soft histogramming, the weight of a pair with separation ``s`` is spread
-over the bins with the softmax of a Gaussian kernel of width ``sigma``.  The
+over the bins by a Gaussian kernel of width ``sigma`` (with either the
+discrete-quadrature normalisation, the default, or the legacy softmax one).  The
 Gaussian has infinite support, but the traversal only counts pairs inside the
 binning range ``[s_edges[0], s_edges[-1])``, so the tails that reach beyond the
 outermost edges are truncated.  The outermost bins therefore average ``xi(s)``
@@ -25,17 +26,18 @@ outermost edges::
 and symmetrically at the lower edge.  The extension is realised with *buffer
 bins*: continuation bins appended to the separation grid, with centres on the
 natural continuation of the grid (geometric for a log-spaced grid, arithmetic
-otherwise, using the local spacing at each edge).  The softmax therefore
-normalises over the real *and* the buffer centres, exactly like an infinite
-virtual continuation of the grid, so pairs beyond the original edges contribute
-their proper (Gaussian-decayed) weight to the outermost real bins, while pairs
-near the edges lose the spurious boost from the truncated normalisation.  The
-buffer-bin counts are discarded from the results; the real bins are returned
-with their original edges.
+otherwise, using the local spacing at each edge).  The kernel therefore spreads
+over the real *and* the buffer centres, exactly like an infinite virtual
+continuation of the grid, so pairs beyond the original edges contribute their
+proper (Gaussian-decayed) weight to the outermost real bins, whether the weights
+are renormalised per pair (``soft_norm='softmax'``) or integrated as a
+discrete quadrature (``soft_norm='gaussian'``).  The buffer-bin counts are
+discarded from the results; the real bins are returned with their original
+edges.
 
 The padding is quantised to whole continuation bins: the number of buffer bins
 per side is ``ceil(z * sigma_edge / spacing)``.  ``soft_pad = 0`` disables
-padding and restores the previous behaviour (softmax over the real bins only,
+padding and restores the previous behaviour (weights over the real bins only,
 pairs in ``[s_edges[0], s_edges[-1])``).
 
 Cost
@@ -223,8 +225,9 @@ def pad_cotangent(cot, nlo, ns_ext):
 
     The buffer bins get zero cotangents: they are discarded from the forward
     counts, so no upstream gradient flows through them.  They do still enter the
-    softmax normalisation of the real-bin weights, which the adjoint kernel
-    replays exactly.
+    forward kernel's window (and, with ``soft_norm='softmax'``, its
+    normalisation of the real-bin weights), which the adjoint kernel replays
+    exactly.
     """
     cot = np.asarray(cot)
     if cot.ndim == 1:

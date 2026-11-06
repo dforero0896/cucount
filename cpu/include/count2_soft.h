@@ -1,4 +1,4 @@
-// Soft (Gaussian-softmax) pair counts on the CPU: forward and adjoint.
+// Soft (Gaussian) pair counts on the CPU: forward and adjoint.
 //
 // This mirrors cuda/include/count2_soft.h entry for entry, so the numpy
 // frontend can run either backend through the same signature. The request

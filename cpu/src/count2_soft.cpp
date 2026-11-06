@@ -49,6 +49,23 @@ using pairmath::pair_bitwise_weight;
 // s axis, forward
 // ---------------------------------------------------------------------------
 
+// Quadrature prefactor of the plain-Gaussian mode, per bin:
+//
+//   A_b = (edges[b+1] - edges[b]) / (sqrt(2 pi) sigma_b),
+//
+// which turns exp(-x_b) into a discrete probability mass. It is a constant for
+// a uniform grid and for a width-scaled sigma; a non-uniform grid with one
+// absolute sigma is the only case that needs the local width. Softmax never
+// calls this.
+inline double soft_s_quadrature_norm(const SoftBinSpec& sp, int bin) {
+    if (sp.s_kernel_norm > 0) return (double) sp.s_kernel_norm;
+
+    // Precomputed on the host: a sqrt per tap costs more than the pass this mode
+    // is meant to save.
+    return (double) sp.quad_norm[bin];
+}
+
+
 // `stride` is the histogram stride between neighbouring s bins: 1 for a plain
 // soft-s request, nell when the multipoles are folded into `hist` (see
 // soft_add_pole, which calls this once per multipole on hist + ill).
@@ -75,6 +92,50 @@ inline void soft_add_uniform(double* hist, const SoftBinSpec& sp, double s, doub
     const double rdn = (rup > 0) ? sp.iq / rup : std::exp(-md - sp.gg);
     const int kmax = sp.kmax;
     const int nbins = static_cast<int>(sp.nbins);
+
+    // Plain normalised Gaussian: one pass, W_b = A_b exp(-x_b). The recurrence
+    // ratios are still relative to the peak bin, so the peak's own weight
+    // exp(-x_m) has to be restored here (softmax would divide it away).
+    if (!sp.norm_softmax) {
+        const double scale =
+            w * std::exp(-u * u * sp.inv2sig2) * soft_s_quadrature_norm(sp, m);
+
+        if (m >= kmax && m + kmax < nbins) {
+            hist[m * stride] += scale;
+
+            double wu = 1, ru = rup, wd = 1, rd = rdn;
+
+            for (int t = 1; t <= kmax; ++t) {
+                wu *= ru;
+                ru *= sp.iq;
+                wd *= rd;
+                rd *= sp.iq;
+                hist[(m + t) * stride] += scale * wu;
+                hist[(m - t) * stride] += scale * wd;
+            }
+            return;
+        }
+
+        hist[m * stride] += scale;
+
+        double wu = 1, ru = rup, wd = 1, rd = rdn;
+        bool oku = true, okd = true;
+
+        for (int t = 1; t <= kmax; ++t) {
+            wu *= ru;
+            ru *= sp.iq;
+            wd *= rd;
+            rd *= sp.iq;
+
+            oku = (m + t < nbins) && (wu > sp.cutoff);
+            okd = (m - t >= 0) && (wd > sp.cutoff);
+
+            if (oku) hist[(m + t) * stride] += scale * wu;
+            if (okd) hist[(m - t) * stride] += scale * wd;
+            if (!oku && !okd) break;
+        }
+        return;
+    }
 
     // Fast path: the whole window is interior, so no tap can leave [0, nbins)
     // and every tap inside kmax is above the cutoff by construction.
@@ -251,6 +312,30 @@ inline void soft_add_general(double* hist, const SoftBinSpec& sp, double s, doub
     const SoftWindow win = soft_general_window(sp, s);
     const int m = win.m;
 
+    // Plain normalised Gaussian: the window offsets are logits relative to the
+    // peak, so exp(-lmin) restores the absolute Gaussian before the quadrature
+    // prefactor. One pass over the taps.
+    if (!sp.norm_softmax) {
+        const double peak = std::exp(-win.lmin);
+
+        hist[m * stride] += w * peak * soft_s_quadrature_norm(sp, m);
+
+        for (int k = 1; k <= win.up; ++k) {
+            const double dd = s - cen[m + k];
+            hist[(m + k) * stride] +=
+                w * peak * soft_s_quadrature_norm(sp, m + k) *
+                soft_tap_weight(dd * dd * i2s2[m + k] - win.lmin, fast);
+        }
+
+        for (int k = 1; k <= win.dn; ++k) {
+            const double dd = s - cen[m - k];
+            hist[(m - k) * stride] +=
+                w * peak * soft_s_quadrature_norm(sp, m - k) *
+                soft_tap_weight(dd * dd * i2s2[m - k] - win.lmin, fast);
+        }
+        return;
+    }
+
     // Pass 1: the normaliser. The peak's weight is exp(0) = 1.
     double sum = 1;
 
@@ -298,15 +383,16 @@ inline void soft_add(double* hist, const SoftBinSpec& sp, double s, double w,
 // Multipole axis: soft mu binning
 // ---------------------------------------------------------------------------
 //
-// mu is softened with the same truncated Gaussian softmax, on a grid over
-// [-1, 1]. What the pair accumulates is not a histogram in mu but the
-// multipoles,
+// mu is softened with the same Gaussian kernel (and the same `soft_norm`), on
+// a grid over [-1, 1]. What the pair accumulates is not a histogram in mu but
+// the multipoles,
 //
-//   M_l = sum_j Wmu_j (2l + 1) P_l(mu_j),       sum_j Wmu_j = 1
+//   M_l = sum_j Wmu_j (2l + 1) P_l(mu_j),
 //
-// and the s scatter multiplies by M_l instead of by 1. P_0 = 1 makes the
-// monopole bit-for-bit the soft-s count, and sigma_mu -> 0 reproduces the hard
-// multipoles up to the quadrature -- the same limit as pyfcfc.
+// and the s scatter multiplies by M_l instead of by 1. Wmu is renormalised per
+// pair (mu lives in the bounded domain [-1, 1]), so P_0 = 1 makes the monopole
+// the soft-s count bit-for-bit. sigma_mu -> 0 reproduces the hard multipoles up
+// to the mu quadrature.
 
 // P_l(centre) for every l <= ellmax, by Bonnet's recursion. The hard kernel's
 // set_legendre() fills only the requested orders on its even-ell fast path,
@@ -324,9 +410,10 @@ inline void soft_legendre_all(double* leg, const int ellmax, const double mu) {
 }
 
 
-// The truncated softmax over the mu grid folded onto the multipoles. DERIV also
-// returns the derivative of the profile with respect to mu, which is what the
-// adjoint needs:
+// The truncated softmax over the mu grid folded onto the multipoles (the
+// legacy soft_norm='softmax' path; the plain-Gaussian variants below share the
+// Legendre folding but no normaliser). DERIV also returns the derivative of
+// the profile with respect to mu, which is what the adjoint needs:
 //
 //   M_l(mu) = sum_j Wmu_j(mu) (2l+1) P_l(c_j) / sum_j Wmu_j(mu)
 //   dM_l/dmu = (dN_l - M_l dS) / S,   dWmu_j/dmu = Wmu_j (c_j - mu)/sigma^2
@@ -479,6 +566,13 @@ inline void soft_mu_profile_general(const SoftBinSpec& sp, const double mu, doub
 
 // Dispatch: the arithmetic grid keeps the two-exp recurrence, anything else the
 // per-tap window. Both fill the same M/dM contract.
+//
+// The mu axis is *always* renormalised, whatever `soft_norm` says about the
+// separation axis: mu = s_parallel / s lives in [-1, 1], a bounded domain, so a
+// kernel that straddles a pole would otherwise lose up to half of its mass
+// there (M_0 ~ 0.5 for a pair within a sigma of |mu| = 1).  Renormalising is
+// what makes the smoothing of a distribution on that domain well defined, and
+// it keeps M_0 == 1 so the monopole *is* the isotropic soft count.
 template <bool DERIV>
 inline void soft_mu_profile(const SoftBinSpec& sp, const double mu, double* M, double* dM) {
     if (sp.mu_uniform)
@@ -520,6 +614,15 @@ inline void soft_add_pole(double* hist, const SoftBinSpec& sp, double s, double 
 // which is pyfcfc's soft_hist_vjp. Membership of the window and the
 // [smin, smax) range check are piecewise constant in s, so they are held fixed,
 // while the window's own renormalisation is differentiated exactly.
+//
+// In the plain-Gaussian mode there is no normaliser to differentiate, W_b =
+// A_b exp(-x_b), and the same sums give
+//
+//   dL/dw_pair = sum_b g_b W_b
+//   dL/ds      = -(2 w_pair / sigma^2) sum_b g_b W_b (s - c_b)
+//   dL/dsigma  = (w_pair / sigma) sum_b g_b W_b (2 x_b - 1)
+//
+// the last term also covering dA_b/dsigma = -A_b / sigma.
 struct SoftVjpPair {
     double dw;
     double ds;
@@ -692,6 +795,129 @@ inline void soft_vjp_pair_general(const double* g, const SoftBinSpec& sp, double
 }
 
 
+// Plain-Gaussian adjoint: there is no normaliser to differentiate, so the
+// per-pair reduction is just
+//
+//   dL/dw      = sum_b g_b W_b
+//   dL/ds      = -2 w sum_b g_b W_b (s - c_b) / (2 sigma_b^2)
+//   dL/dsigma  = (w / sigma) sum_b g_b W_b (2 x_b - 1)
+//
+// with x_b = (s - c_b)^2 / (2 sigma_b^2) and the quadrature prefactor's own
+// 1/sigma derivative already folded into the dsigma line.
+inline void soft_vjp_pair_uniform_gaussian(const double* g, const SoftBinSpec& sp,
+                                           double s, double w, SoftVjpPair* out) {
+    out->dw = 0;
+    out->ds = 0;
+    out->dsigma = 0;
+    out->dmu = 0;
+
+    if (!(s >= sp.lo) || !(s < sp.hi)) return;
+
+    int m = static_cast<int>(std::floor((s - sp.c0) * sp.inv_ds + 0.5));
+
+    if (m < 0)
+        m = 0;
+    else if (m >= static_cast<int>(sp.nbins))
+        m = static_cast<int>(sp.nbins) - 1;
+
+    const double u = s - (sp.c0 + m * sp.ds);
+    const double md = (2 * u - sp.ds) * sp.ds * sp.inv2sig2;
+    const double rup = std::exp(md);
+    const double rdn = (rup > 0) ? sp.iq / rup : std::exp(-md - sp.gg);
+    const int kmax = sp.kmax;
+    const int nbins = static_cast<int>(sp.nbins);
+    const double peak = std::exp(-u * u * sp.inv2sig2);
+
+    double dw = 0, first_moment = 0, logit_moment = 0;
+
+    const auto tap = [&](int B, double relative_weight) {
+        const double c_ = sp.c0 + B * sp.ds;
+        const double d_ = s - c_;
+        const double x_ = d_ * d_ * sp.inv2sig2;
+        const double weight = peak * soft_s_quadrature_norm(sp, B) * relative_weight;
+        const double g_ = g[B];
+        dw += g_ * weight;
+        first_moment += g_ * weight * d_;
+        logit_moment += g_ * weight * x_;
+    };
+
+    tap(m, 1);
+
+    double wu = 1, ru = rup;
+    double wd = 1, rd = rdn;
+
+    for (int t = 1; t <= kmax; ++t) {
+        wu *= ru;
+        ru *= sp.iq;
+        wd *= rd;
+        rd *= sp.iq;
+
+        const bool oku = (m + t < nbins) && (wu > sp.cutoff);
+        const bool okd = (m - t >= 0) && (wd > sp.cutoff);
+
+        if (oku) tap(m + t, wu);
+        if (okd) tap(m - t, wd);
+        if (!oku && !okd) break;
+    }
+
+    out->dw = dw;
+    out->ds = -2 * w * sp.inv2sig2 * first_moment;
+    out->dsigma = w * sp.inv_sigma * (2 * logit_moment - dw);
+}
+
+
+// General-grid counterpart: the same quadrature weights, one exp per tap, and
+// the local 1/sigma_b^2 carried explicitly because it is not constant.
+inline void soft_vjp_pair_general_gaussian(const double* g, const SoftBinSpec& sp,
+                                           double s, double w, SoftVjpPair* out) {
+    out->dw = 0;
+    out->ds = 0;
+    out->dsigma = 0;
+    out->dmu = 0;
+
+    if (!(s >= sp.lo) || !(s < sp.hi)) return;
+
+    const double* cen = sp.centres;
+    const double* i2s2 = sp.inv2s2;
+    const bool fast = sp.fast_taps != 0;
+    const SoftWindow win = soft_general_window(sp, s);
+    const int m = win.m;
+    const double peak = std::exp(-win.lmin);
+
+    double dw = 0, first_moment = 0, logit_moment = 0;
+
+    const auto tap = [&](int B, double relative_weight) {
+        const double c_ = cen[B];
+        const double d_ = s - c_;
+        const double i2_ = i2s2[B];
+        const double x_ = d_ * d_ * i2_;
+        const double weight = peak * soft_s_quadrature_norm(sp, B) * relative_weight;
+        const double g_ = g[B];
+        dw += g_ * weight;
+        first_moment += g_ * weight * d_ * i2_;
+        logit_moment += g_ * weight * x_;
+    };
+
+    tap(m, 1);
+
+    for (int k = 1; k <= win.up; ++k) {
+        const double dd = s - cen[m + k];
+        tap(m + k, soft_tap_weight(dd * dd * i2s2[m + k] - win.lmin, fast));
+    }
+
+    for (int k = 1; k <= win.dn; ++k) {
+        const double dd = s - cen[m - k];
+        tap(m - k, soft_tap_weight(dd * dd * i2s2[m - k] - win.lmin, fast));
+    }
+
+    out->dw = dw;
+    out->ds = -2 * w * first_moment;
+
+    if (!sp.per_bin_sigma)
+        out->dsigma = w * sp.inv_sigma * (2 * logit_moment - dw);
+}
+
+
 // The line of sight as a unit vector plus the two coefficients that carry its
 // own dependence on the endpoints. mu = (diff . lhat) / s, so
 //
@@ -752,6 +978,139 @@ inline void soft_mu_line_of_sight(const LOS_TYPE los, const double* sposition1,
 }
 
 
+// Plain-Gaussian multipole adjoint. The s weights are no longer normalised, so
+// the s gradient is the direct sum over the window rather than a mean-subtracted
+// one, and there is no dsigma term (the mu profile has no sigma of its own here).
+inline void soft_vjp_pair_pole_gaussian(const double* g, const SoftBinSpec& sp,
+                                        double s, double mu, double w,
+                                        SoftVjpPair* out) {
+    out->dw = 0;
+    out->ds = 0;
+    out->dsigma = 0;
+    out->dmu = 0;
+
+    if (!(s >= sp.lo) || !(s < sp.hi)) return;
+
+    double M[CUCOUNT_SOFT_MAXELL], dM[CUCOUNT_SOFT_MAXELL];
+
+    soft_mu_profile<true>(sp, mu, M, dM);
+
+    const int nell = sp.nell;
+
+    double Bl[CUCOUNT_SOFT_MAXELL];
+    double tcg_l[CUCOUNT_SOFT_MAXELL];
+    double T_l[CUCOUNT_SOFT_MAXELL];
+
+    for (int ill = 0; ill < nell; ++ill) {
+        Bl[ill] = 0;
+        tcg_l[ill] = 0;
+        T_l[ill] = 0;
+    }
+
+    if (sp.uniform) {
+        int m = static_cast<int>(std::floor((s - sp.c0) * sp.inv_ds + 0.5));
+
+        if (m < 0)
+            m = 0;
+        else if (m >= static_cast<int>(sp.nbins))
+            m = static_cast<int>(sp.nbins) - 1;
+
+        const double u = s - (sp.c0 + m * sp.ds);
+        const double md = (2 * u - sp.ds) * sp.ds * sp.inv2sig2;
+        const double rup = std::exp(md);
+        const double rdn = (rup > 0) ? sp.iq / rup : std::exp(-md - sp.gg);
+        const int kmax = sp.kmax;
+        const int nbins = static_cast<int>(sp.nbins);
+        const double peak = std::exp(-u * u * sp.inv2sig2);
+
+        const auto tap = [&](int B, double relative_weight) {
+            const double c_ = sp.c0 + B * sp.ds;
+            const double d_ = s - c_;
+            const double weight =
+                relative_weight * peak * soft_s_quadrature_norm(sp, B);
+            const double* g_ = &g[static_cast<size_t>(B) * nell];
+
+            for (int ill = 0; ill < nell; ++ill) {
+                Bl[ill] += weight * g_[ill];
+                tcg_l[ill] += weight * g_[ill] * c_;
+                T_l[ill] += weight * g_[ill] * (-d_) * sp.inv2sig2;
+            }
+        };
+
+        tap(m, 1);
+
+        double wu = 1, ru = rup;
+        double wd = 1, rd = rdn;
+
+        for (int t = 1; t <= kmax; ++t) {
+            wu *= ru;
+            ru *= sp.iq;
+            wd *= rd;
+            rd *= sp.iq;
+
+            const bool oku = (m + t < nbins) && (wu > sp.cutoff);
+            const bool okd = (m - t >= 0) && (wd > sp.cutoff);
+
+            if (oku) tap(m + t, wu);
+            if (okd) tap(m - t, wd);
+            if (!oku && !okd) break;
+        }
+    }
+    else {
+        const double* cen = sp.centres;
+        const double* i2s2 = sp.inv2s2;
+        const bool fast = sp.fast_taps != 0;
+        const SoftWindow win = soft_general_window(sp, s);
+        const int m = win.m;
+        const double peak = std::exp(-win.lmin);
+
+        const auto tap = [&](int B, double relative_weight) {
+            const double c_ = cen[B];
+            const double i2_ = i2s2[B];
+            const double weight =
+                relative_weight * peak * soft_s_quadrature_norm(sp, B);
+            const double* g_ = &g[static_cast<size_t>(B) * nell];
+
+            for (int ill = 0; ill < nell; ++ill) {
+                Bl[ill] += weight * g_[ill];
+                tcg_l[ill] += weight * g_[ill] * c_;
+                T_l[ill] += weight * g_[ill] * (c_ - s) * i2_;
+            }
+        };
+
+        tap(m, 1);
+
+        for (int k = 1; k <= win.up; ++k) {
+            const double dd = s - cen[m + k];
+            tap(m + k, soft_tap_weight(dd * dd * i2s2[m + k] - win.lmin, fast));
+        }
+
+        for (int k = 1; k <= win.dn; ++k) {
+            const double dd = s - cen[m - k];
+            tap(m - k, soft_tap_weight(dd * dd * i2s2[m - k] - win.lmin, fast));
+        }
+    }
+
+    double A = 0;
+    double tcg = 0;
+    double T = 0;
+
+    for (int ill = 0; ill < nell; ++ill) {
+        A += M[ill] * Bl[ill];
+        tcg += M[ill] * tcg_l[ill];
+        T += M[ill] * T_l[ill];
+        out->dmu += w * Bl[ill] * dM[ill];
+    }
+
+    out->dw = A;
+
+    if (sp.uniform)
+        out->ds = w * 2 * sp.inv2sig2 * (tcg - s * A);
+    else
+        out->ds = 2 * w * T;
+}
+
+
 // Adjoint of a pair counted with soft mu binning. The multipole profile is
 // gathered through the same truncated mu window the forward used, and the
 // cotangent is contracted with it in two directions at once:
@@ -768,6 +1127,11 @@ inline void soft_vjp_pair_pole(const double* g, const SoftBinSpec& sp, double s,
     out->dmu = 0;
 
     if (!(s >= sp.lo) || !(s < sp.hi)) return;
+
+    if (!sp.norm_softmax) {
+        soft_vjp_pair_pole_gaussian(g, sp, s, mu, w, out);
+        return;
+    }
 
     double M[CUCOUNT_SOFT_MAXELL], dM[CUCOUNT_SOFT_MAXELL];
 
@@ -944,10 +1308,18 @@ inline void soft_vjp_pair(const double* g, const SoftBinSpec& sp, double s, doub
                           double w, SoftVjpPair* out) {
     if (sp.nell > 0)
         soft_vjp_pair_pole(g, sp, s, mu, w, out);
-    else if (sp.uniform)
-        soft_vjp_pair_uniform(g, sp, s, w, out);
-    else
-        soft_vjp_pair_general(g, sp, s, w, out);
+    else if (sp.uniform) {
+        if (sp.norm_softmax)
+            soft_vjp_pair_uniform(g, sp, s, w, out);
+        else
+            soft_vjp_pair_uniform_gaussian(g, sp, s, w, out);
+    }
+    else {
+        if (sp.norm_softmax)
+            soft_vjp_pair_general(g, sp, s, w, out);
+        else
+            soft_vjp_pair_general_gaussian(g, sp, s, w, out);
+    }
 }
 
 
@@ -1012,9 +1384,9 @@ void Count2Soft(const Count2SoftArgs& args) {
     // the device instead (both derive them in soft_build_host_tables()).
     // (FLOAT is a common.h macro that cmath.h undefines in the CPU translation
     // units, and on the host it is double.)
-    std::vector<double> s_centres, s_inv2s2, s_edges;
+    std::vector<double> s_centres, s_inv2s2, s_edges, s_quad_norm;
     std::vector<double> mu_centres, mu_inv2s2, mu_edges;
-    soft_build_host_tables(spec, s_centres, s_inv2s2, s_edges,
+    soft_build_host_tables(spec, s_centres, s_inv2s2, s_edges, s_quad_norm,
                            mu_centres, mu_inv2s2, mu_edges);
 
     const ScalarMesh m1 = build_mesh(args.p1, mattrs);
@@ -1110,9 +1482,9 @@ void Count2SoftVjp(const Count2SoftVjpArgs& args) {
     // the device instead (both derive them in soft_build_host_tables()).
     // (FLOAT is a common.h macro that cmath.h undefines in the CPU translation
     // units, and on the host it is double.)
-    std::vector<double> s_centres, s_inv2s2, s_edges;
+    std::vector<double> s_centres, s_inv2s2, s_edges, s_quad_norm;
     std::vector<double> mu_centres, mu_inv2s2, mu_edges;
-    soft_build_host_tables(spec, s_centres, s_inv2s2, s_edges,
+    soft_build_host_tables(spec, s_centres, s_inv2s2, s_edges, s_quad_norm,
                            mu_centres, mu_inv2s2, mu_edges);
 
     const IndexValue& index_value1 = args.p1.index_value;

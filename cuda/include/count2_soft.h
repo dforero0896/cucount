@@ -1,7 +1,7 @@
 #ifndef _CUCOUNT_COUNT2_SOFT_
 #define _CUCOUNT_COUNT2_SOFT_
 
-// Soft (Gaussian-softmax) pair counts on the separation axis.
+// Soft (Gaussian) pair counts on the separation axis.
 //
 // This is an extension, not a mode of count2: its own header, its own
 // translation unit, its own binding. The hard kernel's inner loop is the
@@ -17,12 +17,17 @@
 //
 //   c_i = (edges[i] + edges[i+1]) / 2      bin centres
 //   x_i = (s - c_i)^2 / (2 sigma_i^2)      Gaussian logits
-//   W_i = exp(-x_i) / sum_j exp(-x_j)      softmax over the bins
+//   W_i = A_i exp(-x_i)                    soft_norm='gaussian' (default)
+//   W_i = exp(-x_i) / sum_j exp(-x_j)      soft_norm='softmax' (legacy)
 //   counts[i] += w_pair * W_i              per pair, w_pair = product of weights
 //
-// The sum runs over the taps within ``cutoff`` of the peak, then everything is
-// renormalized, so a pair's weight is exactly conserved and sigma -> 0
-// degenerates to hard binning (nearest centre). Pairs outside [smin, smax) are
+// with the discrete-quadrature prefactor A_i = dmui / (sqrt(2 pi) sigma_i).
+// The gaussian mode needs one pass over the taps and keeps every bin's weight
+// independent of the others (no competing normalisation), at the cost of a
+// per-pair sum of 1 only up to quadrature error. The softmax mode sums the
+// window and renormalizes, so a pair's weight is exactly conserved and
+// sigma -> 0 degenerates to hard binning (nearest centre). Both modes drop
+// taps beyond ``cutoff``. Pairs outside [smin, smax) are
 // dropped whole, exactly as the hard kernel drops them, which is what makes the
 // soft and hard totals agree at any sigma.
 //
@@ -47,15 +52,19 @@
 // a constant of the binning: there is no dL/dsigma to compute for it.
 //
 // Multipoles (a second axis, VAR_POLE) are softened on the *mu* axis with the
-// same truncated softmax, evaluated on a uniform grid of nmu centres over
-// [-1, 1]. The mu weights are folded into the multipoles before the s scatter,
+// same Gaussian kernel, evaluated on a grid of nmu centres over [-1, 1]. The
+// kernel follows ``soft_norm`` on the mu axis too. The mu weights are folded
+// into the multipoles before the s scatter,
 //
-//   M_l = sum_j Wmu_j (2 l + 1) P_l(mu_j),        sum_j Wmu_j = 1
+//   M_l = sum_j Wmu_j (2 l + 1) P_l(mu_j),   (sum_j Wmu_j = 1: mu is renormalised)
 //   counts[s bin i, l] += w_pair * Ws_i * M_l
 //
 // so a pair costs taps_s * nell histogram updates instead of the
 // taps_s * taps_mu it would cost to soften both axes on the histogram grid.
-// P_0 = 1, so M_0 = 1 and the monopole is exactly the soft-s count.
+// P_0 = 1, so M_0 = 1 exactly and the monopole is the soft-s count. The mu axis
+// is renormalised whatever ``soft_norm`` selects for the separation axis,
+// because mu is bounded to [-1, 1] and a plain kernel would lose mass at the
+// poles (no padding can recover a bounded domain).
 //
 // mu is *not* folded: it runs over the full [-1, 1] interval that cucount's
 // line of sight defines, so odd multipoles are meaningful and no |mu| symmetry is
@@ -101,12 +110,24 @@ void count2_soft(FLOAT *counts, const Mesh *list_mesh, const Count2Attrs &attrs,
 // Why this is a second kernel rather than reverse-mode AD: the forward is a
 // scatter into a histogram, so its input cotangent is a gather from the same
 // window, and the per-pair reduction collapses to a handful of sums. Written
-// out (c_b = centres, x_b = logits, W_b = softmax, cbar/xbar their W-means):
+// out (c_b = centres, x_b = logits, W_b = the bin weight, cbar/xbar their
+// W-means; softmax mode):
 //
 //   dL/dw_pair = sum_b g_b W_b                          (a scalar per pair)
 //   dL/ds      = (w_pair / sigma^2) sum_b g_b W_b (c_b - cbar)
 //   dL/dsigma  = (2 w_pair / sigma) sum_b g_b W_b (x_b - xbar)
 //   dL/dr_i    = dL/ds * (r_i - r_j) / s ,  dL/dr_j = -dL/dr_i
+//
+// In gaussian mode W_b = A_b exp(-x_b) and the sums above lose their cbar/xbar
+// normalisation terms; the same reduction becomes
+//
+//   dL/dw_pair = sum_b g_b W_b
+//   dL/ds      = -(2 w_pair / sigma^2) sum_b g_b W_b (s - c_b)
+//   dL/dsigma  = (w_pair / sigma) sum_b g_b W_b (2 x_b - 1)
+//
+// (dsigma only for a single absolute sigma; a per-bin sigma is a constant of
+// the binning, as in softmax mode). The mu chain below likewise drops its
+// 1/sum_j Wmu_j factors and M_l = sum_j Wmu_j (2l+1) P_l(mu_j) directly.
 //
 // With soft mu binning there is one more chain: the multipole profile
 // M_l = sum_j Wmu_j (2l+1) P_l(mu_j) depends on the pair's mu,

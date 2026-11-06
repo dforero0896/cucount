@@ -883,7 +883,7 @@ def count3(
     return count3_fn(*particles)
 
 
-# Soft (Gaussian-softmax) pair counts live in their own module, next to this one;
+# Soft (Gaussian) pair counts live in their own module, next to this one;
 # re-exported here for convenience only, so a build without the soft kernel still
 # imports the hard path untouched.
 try:

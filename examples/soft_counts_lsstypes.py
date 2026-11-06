@@ -1,16 +1,20 @@
 """Soft pair counts through the lsstypes frontend, next to the hard binning.
 
 ``cucount.types.count2`` places every pair in exactly one bin; ``count2_soft``
-shares it between neighbouring bins with a Gaussian softmax. This script does
+shares it between neighbouring bins with a Gaussian kernel. This script does
 the comparison a user actually cares about:
 
 * isotropic soft counts against the hard ones, on a **logarithmic** separation
   grid (so ``sigma`` scales with each bin width) and with an explicit constant
   ``sigma``;
-* weight conservation: softening moves counts between bins, it never loses them;
+* weight conservation in the legacy ``soft_norm='softmax'`` mode, which is what
+  the panels below run: softening moves counts between bins, it never loses
+  them. (The default ``'gaussian'`` quadrature keeps all but the ~0.5%
+  quadrature error of a half-bin sigma.);
 * soft multipoles: ``pole=([0, 2, 4], 'midpoint')`` also smooths the mu axis, so
   the quadrupole/hexadecapole come out differentiable instead of piecewise
-  constant.
+  constant. The mu axis is always renormalised (it is bounded to [-1, 1]), so
+  the ell = 0 column is exactly the isotropic soft count.
 
 The counts above run on either backend (``CUCOUNT_BACKEND=cpu`` forces the CPU
 kernel), and so do the jit/gradient panels: ``cucount.jax.soft`` has both CUDA
@@ -96,9 +100,14 @@ def main():
     # Pin the unpadded estimator: this example compares its weight sum with the
     # hard counts, while the default `soft_pad=2` also counts pairs beyond the
     # binning range that leak back into the real bins.
-    soft_default = count2_soft(p, battrs=battrs_s, mattrs=mattrs, soft_pad=0.0)['weight']
+    # The conservation panel below is exact only for the softmax normalisation;
+    # the gaussian default is a discrete quadrature (about 0.5% off at the
+    # half-bin sigma) and also drops the kernel tail beyond the counted range.
+    # Softmax is pinned here so the panel demonstrates exact conservation.
+    soft_default = count2_soft(p, battrs=battrs_s, mattrs=mattrs, soft_pad=0.0,
+                               soft_norm='softmax')['weight']
     soft_wide = count2_soft(p, battrs=battrs_s, mattrs=mattrs, soft_sigma=4.0,
-                            soft_pad=0.0)['weight']
+                            soft_pad=0.0, soft_norm='softmax')['weight']
 
     soft_meta = dict(soft_default.attrs)
     print(f'grid: {EDGES.size - 1} logarithmic bins in [{EDGES[0]:g}, {EDGES[-1]:g}]')

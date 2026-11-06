@@ -162,6 +162,7 @@ void set_count2_soft_attrs_py(
     double soft_cutoff = 1e-13,
     const std::string &soft_taps = "exact",
     const std::string &soft_accum = "float32",
+    const std::string &soft_norm = "gaussian",
     double soft_mu_sigma = 0.,
     int soft_mu_bins = 0,
     py::object soft_mu_edges = py::none())
@@ -194,7 +195,8 @@ void set_count2_soft_attrs_py(
     soft_spec2 = make_soft_bin_spec(
         battrs2, wattrs2, spattrs2, soft_sigma, soft_cutoff, &csize, soft_mu_sigma,
         soft_mu_bins, soft_mu_edges2.empty() ? nullptr : soft_mu_edges2.data(),
-        (int) soft_mu_edges2.size());
+        (int) soft_mu_edges2.size(), /*acc_float=*/1, /*backend=*/"cuda",
+        soft_norm.c_str());
 
     if (soft_taps == "fast") {
         soft_spec2.fast_taps = 1;
@@ -1027,7 +1029,7 @@ PYBIND11_MODULE(ffi_cuda, m) {
 
     m.def("count2", []() { return EncapsulateFfiCall(count2ffi); });
 
-    // Soft (Gaussian-softmax) binning: an extension with its own request setter,
+    // Soft (Gaussian) binning: an extension with its own request setter,
     // its own forward target and its own adjoint target, so the count2 path above
     // is untouched.
     m.def("set_count2_soft_attrs", &set_count2_soft_attrs_py, "Set soft count2 attributes",
@@ -1040,6 +1042,7 @@ PYBIND11_MODULE(ffi_cuda, m) {
         py::arg("soft_cutoff") = 1e-13,
         py::arg("soft_taps") = "exact",
         py::arg("soft_accum") = "float32",
+        py::arg("soft_norm") = "gaussian",
         py::arg("soft_mu_sigma") = 0.,
         py::arg("soft_mu_bins") = 0,
         py::arg("soft_mu_edges") = py::none());

@@ -64,7 +64,7 @@ def _setup(n=300, seed=11, edges=EDGES, box=BOX, periodic=True, weights=True):
 
 
 def _brute_soft(p, edges, sigma, box=None):
-    """Ordered-pair reference: minimum-image separation, full-grid softmax."""
+    """Ordered-pair reference: minimum-image separation, full-grid kernel."""
     pos = np.asarray(p.positions)
     w = np.asarray(p.values[0]) if p.values else np.ones(pos.shape[0])
     i, j = np.indices((pos.shape[0], pos.shape[0]))
@@ -84,8 +84,18 @@ def test_soft_s_runs_on_cpu_and_conserves_weight():
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cpu')['weight']
     soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu')
     assert soft['weight'].shape == hard.shape
-    # Smoothing redistributes pairs; it must not reweight them.
-    np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=1e-13)
+    # The default is the plain Gaussian quadrature: each pair deposits one unit
+    # of weight only to quadrature accuracy (~0.5% at the half-bin sigma), and
+    # the kernel tail falling outside [edges[0], edges[-1]) is dropped, which
+    # costs a couple of percent here.  softmax renormalises and so is exact.
+    assert soft['soft']['norm'] == 'gaussian'
+    np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=5e-2)
+
+    # The legacy softmax renormalises each pair's window, so it conserves
+    # exactly; this is the property that mode exists for.
+    sm = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu', soft_norm='softmax')
+    assert sm['soft']['norm'] == 'softmax'
+    np.testing.assert_allclose(sm['weight'].sum(), hard.sum(), rtol=1e-13)
 
 
 @needs_cpu
@@ -117,11 +127,15 @@ def test_default_sigma_is_half_a_bin():
 
 @needs_cpu
 def test_sigma_to_zero_recovers_hard_binning():
-    """On a uniform grid the limit is the hard histogram, as for the oracle."""
+    """Under softmax the narrow-kernel limit is the hard histogram, as for the oracle."""
     p, ba, ma = _setup()
     hard = count2(p, p, battrs=ba, mattrs=ma, backend='cpu')['weight']
+    # Only the softmax normalisation has this limit: the gaussian quadrature
+    # mass A_b grows like 1/sigma as the kernel narrows, so it does not vanish
+    # into a single bin.
     soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu',
-                       soft_sigma=1e-6, soft_cutoff=1e-13)['weight']
+                       soft_sigma=1e-6, soft_cutoff=1e-13,
+                       soft_norm='softmax')['weight']
     np.testing.assert_allclose(soft, hard, rtol=1e-10, atol=1e-8 * hard.max())
 
 
@@ -132,7 +146,7 @@ def test_logarithmic_grid_matches_the_numpy_reference():
     got = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu')
     assert got['soft']['uniform'] is False
     sigma = 0.5 * np.diff(LOG_EDGES)
-    # Per-bin sigma: compare against the same truncated softmax computed directly.
+    # Per-bin sigma: compare against the same quadrature kernel computed directly.
     pos = np.asarray(p.positions)
     w = np.asarray(p.values[0])
     i, j = np.indices((pos.shape[0], pos.shape[0]))
@@ -142,10 +156,12 @@ def test_logarithmic_grid_matches_the_numpy_reference():
     inside = (s >= LOG_EDGES[0]) & (s < LOG_EDGES[-1]) & (i != j)
     ref = np.zeros(LOG_EDGES.size - 1)
     centres = 0.5 * (LOG_EDGES[:-1] + LOG_EDGES[1:])
+    widths = np.diff(LOG_EDGES)
     for sv, ww in zip(s[inside], (w[i] * w[j])[inside]):
         x = (sv - centres) ** 2 / (2.0 * sigma ** 2)
-        wt = np.exp(-(x - x.min()))
-        ref += ww * wt / wt.sum()
+        # Default (gaussian): discrete-quadrature masses, not a per-pair softmax.
+        wt = np.exp(-x) * widths / (np.sqrt(2.0 * np.pi) * sigma)
+        ref += ww * wt
     np.testing.assert_allclose(got['weight'], ref, rtol=1e-10, atol=1e-12 * ref.max())
 
 
@@ -242,6 +258,7 @@ def test_meta_reports_the_cpu_accumulator():
     assert meta['copies'] == 0
     assert meta['nbins'] == EDGES.size - 1
     assert meta['uniform'] is True
+    assert meta['norm'] == 'gaussian'
     assert meta['taps'] == 2 * meta['kmax'] + 1
 
 
@@ -287,11 +304,20 @@ def test_multipoles_and_mu_edges():
     p = Particles(pos, rng.uniform(0.5, 1.5, 200))
     ba = BinAttrs(s=EDGES, pole=(np.array([0, 2, 4]), 'z'))
     ma = MeshAttrs(p, p, boxsize=BOX, battrs=ba, periodic=True)
-    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu')
+    soft = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu',
+                       soft_norm='softmax')
     assert soft['weight'].shape == (EDGES.size - 1, 3)
-    # M_0 = 1 exactly, so the monopole is the soft-s count.
-    mono = count2_soft(p, p, battrs=BinAttrs(s=EDGES), mattrs=ma, backend='cpu')
+    assert soft['soft']['norm'] == 'softmax'
+    # The mu axis is renormalised whatever soft_norm selects for s, so M_0 = 1
+    # exactly and the monopole is the soft-s count in either mode.
+    mono = count2_soft(p, p, battrs=BinAttrs(s=EDGES), mattrs=ma, backend='cpu',
+                       soft_norm='softmax')
     np.testing.assert_allclose(soft['weight'][:, 0], mono['weight'], rtol=1e-13)
+
+    gauss = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu')
+    assert gauss['soft']['norm'] == 'gaussian'
+    gmono = count2_soft(p, p, battrs=BinAttrs(s=EDGES), mattrs=ma, backend='cpu')
+    np.testing.assert_allclose(gauss['weight'][:, 0], gmono['weight'], rtol=1e-13)
 
     mu_edges = np.cos(np.linspace(0.0, np.pi, 25))[::-1]
     explicit = count2_soft(p, p, battrs=ba, mattrs=ma, backend='cpu',
@@ -343,7 +369,8 @@ def test_selection_is_applied_like_the_cuda_kernel():
     # has the Gaussian tail of the 20..26 pc pairs unless the selection vetoes
     # them, and a vetoed pair must vanish from the scatter entirely.
     sa = SelectionAttrs(s=(10.0, 20.0))
-    soft = count2_soft(p, p, battrs=ba, mattrs=ma, sattrs=sa, backend='cpu')
+    soft = count2_soft(p, p, battrs=ba, mattrs=ma, sattrs=sa, backend='cpu',
+                       soft_norm='softmax')
     hard = count2(p, p, battrs=ba, mattrs=ma, sattrs=sa, backend='cpu')['weight']
     np.testing.assert_allclose(soft['weight'].sum(), hard.sum(), rtol=1e-13)
     assert hard[4] == 0.0

@@ -1,20 +1,26 @@
-"""Soft (Gaussian-softmax) two-point pair counts.
+"""Soft (Gaussian) two-point pair counts.
 
 This is an *extension* to :mod:`cucount.numpy`, not a replacement: imports the
 hard-binning frontend and adds one entry point beside it. The hard ``count2``
 is untouched -- no option, flag or branch was added to it -- so an existing
 call cannot change meaning or speed because this module exists.
 
-Semantics follow the pyfcfc oracle (``FCFC-main/src/fcfc/2pt/soft_hist.c``):
-every pair inside the separation range is spread over the separation bins with
-the softmax of a Gaussian kernel centred on the bin centres,
+Every pair inside the separation range is spread over the separation bins with a
+Gaussian kernel centred on the bin centres,
 
     x_i     = (s - c_i)^2 / (2 sigma_i^2),   c_i = (edges[i] + edges[i+1]) / 2
-    W_i     = exp(-x_i) / sum_j exp(-x_j)
+    W_i     = A_i exp(-x_i)                  soft_norm='gaussian' (default)
+    W_i     = exp(-x_i) / sum_j exp(-x_j)    soft_norm='softmax' (legacy)
     counts += w_pair * W_i
 
-so a pair's weight is exactly conserved (the row sums to one), and sigma -> 0
-recovers hard binning.
+with the discrete-quadrature prefactor ``A_i = dmui / (sqrt(2 pi) sigma_i)``.
+The gaussian mode is a single pass and keeps each bin's weight independent of
+its neighbours (no competing normalisation), at the cost of a per-pair row sum
+of one only up to quadrature error (about 0.5% at the default
+``sigma = dmu/2``), plus whatever kernel tail falls outside the counted range
+(``soft_pad`` recovers that part). The softmax mode sums the window and renormalises, so a
+pair's weight is exactly conserved. In both modes ``sigma -> 0`` recovers hard
+binning.
 
 ``sigma=None`` means "half a bin", the oracle's default, and on a non-uniform
 grid it means half of *each* bin, ``sigma_i = 0.5 * (edges[i+1] - edges[i])``.
@@ -28,15 +34,23 @@ multiplicative recurrence (two ``exp`` per pair), any other grid uses a binary
 search for the peak plus one ``exp`` per tap.
 
 With a ``pole`` axis the ``mu`` axis is softened as well and the result is
-soft multipoles: the same truncated softmax is applied to a uniform ``mu`` grid,
-and each pair deposits ``w_pair * Ws_i * M_l`` where
+soft multipoles: a Gaussian kernel is applied to a ``mu`` grid, and each pair
+deposits ``w_pair * Ws_i * M_l`` where
 
-    M_l(mu) = sum_j Wmu_j (2l+1) P_l(mu_j),    Wmu_j = softmax_j(-(mu - mu_j)^2 / (2 sigma_mu^2))
+    M_l(mu) = sum_j Wmu_j (2l+1) P_l(mu_j),
+    Wmu_j   = exp(-(mu - mu_j)^2 / (2 sigma_mu^2)) / sum_k exp(...)
 
 so the mu weights never touch the histogram (that is what would make them
 expensive): the multipole profile is computed once per pair and multiplied by
-the separation weights, which keeps the cost at ``taps_s * nell``. ``M_0 = 1``
-exactly, so the monopole is the soft-s count.
+the separation weights, which keeps the cost at ``taps_s * nell``.
+
+The mu axis is renormalised whatever ``soft_norm`` selects for the separation
+axis. ``mu = s_parallel / s`` is confined to ``[-1, 1]``, so a kernel that
+straddles a pole would otherwise lose up to half of its mass there (``M_0``
+near 0.5 for a pair within a ``sigma_mu`` of ``|mu| = 1``), and padding is not
+an option on a bounded domain. Renormalising is what makes smoothing a
+distribution on that domain well defined: ``M_0 = 1`` exactly, so the monopole
+*is* the isotropic soft-s count.
 
 Differences from the oracle, both because the kernel is new rather than a port:
 
@@ -44,8 +58,9 @@ Differences from the oracle, both because the kernel is new rather than a port:
 * the CUDA kernel scatters through a shared-memory histogram tile rather than
   the oracle's scalar loop, and the CPU kernel visits every pair once per
   OpenMP thread into a thread-private histogram (double, reduced at the end);
-* weights outside ``soft_cutoff`` of the peak are dropped and the window is
-  renormalised, as the oracle does. Its default cutoff is 1e-13, which is what
+* weights outside ``soft_cutoff`` of the peak are dropped. In softmax mode the
+  window is then renormalised, as the oracle does; in gaussian mode the dropped
+  tail is a small quadrature error. Its default cutoff is 1e-13, which is what
   makes the tap count (and so the cost) ~9 taps per pair at the default sigma.
 """
 import numpy as np
@@ -262,16 +277,23 @@ def soft_mu_weights(mu, ells, soft_mu_sigma=None, soft_mu_bins=0,
                     soft_cutoff=1e-13, soft_mu_edges=None):
     """Reference multipole profile, shape ``(len(mu), len(ells))``.
 
-    ``M_l(mu)`` for the requested ``ells`` on the kernel's truncated mu window,
-    renormalised so ``M_0 == 1``. This is the definition the kernel implements;
-    it exists so tests and plots do not have to re-derive it. mu is used
-    unfolded: a negative mu stays negative.
+    ``M_l(mu)`` for the requested ``ells`` on the kernel's truncated mu window.
+    The cell weights are renormalised per mu, so ``M_0 == 1`` exactly and the
+    monopole is the isotropic soft count.
+
+    The mu axis is renormalised whatever ``soft_norm`` says about the
+    separation axis: ``mu = s_parallel / s`` is confined to ``[-1, 1]``, so an
+    un-renormalised kernel straddling a pole would silently lose up to half of
+    its mass there. This is the definition the kernel implements; it exists so
+    tests and plots do not have to re-derive it. mu is used unfolded: a
+    negative mu stays negative.
     """
     mu = np.atleast_1d(np.asarray(mu, dtype=np.float64))
     ells = np.atleast_1d(np.asarray(ells, dtype=np.int64))
     spec = mu_spec(soft_mu_sigma, soft_mu_bins, soft_mu_edges, soft_cutoff)
     centres = spec['centres']
     sigmas = spec['sigmas']
+    widths = np.diff(spec['edges'])
     nmu = centres.size
 
     # P_l at every centre, (nmu, nell), for the orders that were asked for.
@@ -291,48 +313,86 @@ def soft_mu_weights(mu, ells, soft_mu_sigma=None, soft_mu_bins=0,
             lo = max(peak - kmax, 0)
             hi = min(peak + kmax, nmu - 1)
             x = (m_ - centres[lo:hi + 1]) ** 2 / (2.0 * sigmas[lo:hi + 1] ** 2)
-            w = np.exp(-(x - x.min()))
-            w /= w.sum()
+            w = _kernel_weights(x, widths[lo:hi + 1], sigmas[lo:hi + 1],
+                                'softmax')
             out[i] = w @ (pf * leg[lo:hi + 1])
     else:
         # Full-grid stable softmax. The kernel truncates the same weights at the
         # cutoff, which drops less than `cutoff` of the normalisation.
         for i, m_ in enumerate(mu):
             x = (m_ - centres) ** 2 / (2.0 * sigmas ** 2)
-            w = np.exp(-(x - x.min()))
-            w /= w.sum()
+            w = _kernel_weights(x, widths, sigmas, 'softmax')
             out[i] = w @ (pf * leg)
 
     return out
 
 
-def soft_weights(s, edges, sigma=None):
+def _kernel_weights(x, widths, sigmas, soft_norm):
+    """Cell weights for logits ``x``, mirroring the kernel's normalisation.
+
+    ``'gaussian'`` is the discrete-quadrature mass ``width / (sqrt(2 pi) sigma)
+    exp(-x)``; ``'softmax'`` is the legacy per-window renormalisation, which is
+    what the kernel used before the option existed.
+    """
+    e = np.exp(-x)
+
+    if soft_norm == 'softmax':
+        # Normalise each row: one row is one pair, so the sum has to run over
+        # the bins of that pair and not over the whole (pairs x bins) array.
+        e /= e.sum(axis=-1, keepdims=True)
+
+        return e
+
+    if soft_norm != 'gaussian':
+        raise ValueError(
+            f"soft_norm must be 'gaussian' or 'softmax', got {soft_norm!r}")
+
+    return e * widths / (np.sqrt(2.0 * np.pi) * sigmas)
+
+
+def soft_weights(s, edges, sigma=None, soft_norm='gaussian'):
     """Reference weights, shape ``(len(s), len(edges) - 1)``.
 
-    Full-grid stable softmax over the bin centres -- no window truncation, so
-    this is the definition rather than the kernel's truncated version; the two
-    agree to the cutoff tail. Follows the kernel's sigma rule: ``None`` means
-    half of each bin's width, a number means one absolute width.
+    Full-grid weights over the bin centres -- no window truncation, so this is
+    the definition rather than the kernel's truncated version; the two agree to
+    the cutoff tail. Follows the kernel's sigma rule: ``None`` means half of
+    each bin's width, a number means one absolute width.
+
+    ``soft_norm='gaussian'`` (the default) is the discrete-quadrature mass
+    ``w_i = dmui / (sqrt(2 pi) sigma_i) exp(-x_i)``, whose per-pair sum is 1 up
+    to quadrature error; ``'softmax'`` renormalises each row exactly.
     """
     s = np.atleast_1d(np.asarray(s, dtype=np.float64))
+    edges = np.asarray(edges, dtype=np.float64)
     centres = _bin_centres(edges)
     sg = sigmas(edges, sigma)
     x = (s[:, None] - centres[None, :]) ** 2 / (2.0 * sg[None, :] ** 2)
-    x -= x.min(axis=1, keepdims=True)
-    e = np.exp(-x)
-    return e / e.sum(axis=1, keepdims=True)
+    widths = np.diff(edges)
+
+    if soft_norm == 'softmax':
+        x -= x.min(axis=1, keepdims=True)
+
+    return _kernel_weights(x, widths, sg, soft_norm)
 
 
 def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
                 soft_cutoff: float=1e-13, soft_taps: str='exact',
                 soft_accum: str='float32', soft_pad: float=None,
+                soft_norm: str='gaussian',
                 soft_mu_sigma: float=None, soft_mu_bins: int=0,
                 soft_mu_edges=None,
                 wattrs: WeightAttrs=None,
                 sattrs: SelectionAttrs=None, spattrs: SplitAttrs=None,
                 mattrs: MeshAttrs=None, nthreads: int=1, backend: str=None,
                 tuning: dict=None):
-    """Two-point pair counts with Gaussian-softmax soft binning on ``s``.
+    """Two-point pair counts with Gaussian soft binning on ``s``.
+
+    The kernel assigns each pair a Gaussian weight on the separation axis. Two
+    normalisations are available; ``soft_norm='gaussian'`` (the default) is the
+    discrete-quadrature mass ``w_i = dmui / (sqrt(2 pi) sigma_i) exp(-x_i)``,
+    which needs a single pass and treats every bin independently, so the
+    gradients stay well conditioned; ``soft_norm='softmax'`` renormalises the
+    window so the weights sum to exactly 1, which costs a second pass.
 
     Parameters
     ----------
@@ -349,10 +409,11 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
         non-uniform grid that is half of each bin, i.e. ``sigma_i`` tracks the
         local width.
     soft_cutoff : float, optional
-        Relative weight below which the Gaussian tail is dropped (the window is
-        renormalised, so weight stays conserved). This is the speed knob: the
-        tap count grows as ``sqrt(2 ln(1 / cutoff))``. Default 1e-13 matches
-        the oracle.
+        Relative weight below which the Gaussian tail is dropped. With
+        ``soft_norm='softmax'`` the window is renormalised, so weight stays
+        conserved exactly; with ``'gaussian'`` the dropped tail is simply a
+        small quadrature error. This is the speed knob: the tap count grows as
+        ``sqrt(2 ln(1 / cutoff))``. Default 1e-13 matches the oracle.
     soft_taps : {'exact', 'fast'}
         Only affects the general (non-uniform) path. ``'exact'`` (default) uses
         double ``exp``; ``'fast'`` uses ``__expf``, trading ~1e-6 relative
@@ -365,14 +426,27 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
         the only cost is rounding when each block adds its partial sum to the
         output histogram (a few 1e-7 relative). Use ``'float64'`` to recover the
         previous bit-comparable path, e.g. for conservation tests at 1e-15.
+    soft_norm : {'gaussian', 'softmax'}
+        How the Gaussian weights are normalised. ``'gaussian'`` (default) uses
+        the discrete-quadrature prefactor ``dmui / (sqrt(2 pi) sigma_i)``: one
+        pass per pair, no per-pair sum, per-bin weights that do not compete, so
+        gradients are less prone to collapsing onto one bin. The per-pair sum
+        is then 1 only up to quadrature error (about 0.5% for the default
+        ``sigma = dmu/2``), and the kernel tail outside the binning range is
+        simply dropped (see ``soft_pad``). ``'softmax'`` is the legacy
+        behaviour: weights are divided by the window sum (an extra pass), which
+        conserves weight exactly. This selects the separation-axis
+        normalisation only; the mu axis is always renormalised, because
+        ``mu`` in ``[-1, 1]`` is a bounded domain where an un-renormalised
+        kernel would lose mass at the poles.
     soft_pad : float, optional
         Edge padding in kernel widths. The traversal only counts pairs inside
         the binning range, so without padding the outermost bins average a
-        *truncated* kernel: the last bin is biased high and the first low. With
-        ``soft_pad = z`` the counting range is extended by ``z`` kernel widths
-        with buffer bins (geometric continuation on a log grid, arithmetic
-        otherwise); the softmax normalises over the real and buffer centres, and
-        the buffer bins are dropped from the returned counts. ``None`` selects
+        *truncated* kernel and pick up an edge bias. With ``soft_pad = z`` the
+        counting range is extended by ``z`` kernel widths with buffer bins
+        (geometric continuation on a log grid, arithmetic otherwise); the kernel
+        deposits over the real and buffer centres (the softmax also normalises
+        over them), and the buffer bins are dropped from the returned counts. ``None`` selects
         the pyfcfc default, ``z = 2``; ``0`` restores the previous estimator
         bit for bit. In a periodic box the extension is clamped below ``L/2``.
         Padding costs the extra pairs in the buffer shells (roughly
@@ -406,7 +480,8 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
         multipoles, plus ``result['soft']`` describing what ran
         (``sigma`` after the default, ``sigma_kind`` = 'absolute' or 'width',
         ``uniform``, ``fast_taps``, ``accum`` = 'float32' or 'float64',
-        ``cutoff``, ``kmax``, ``taps`` (``-1`` when
+        ``cutoff``, ``kmax``, ``norm`` = 'gaussian' or 'softmax',
+        ``taps`` (``-1`` when
         the window is adaptive), ``path`` = 'shared' or 'global', ``nbins``,
         and for multipoles ``multipoles``, ``mu_sigma``, ``mu_bins``,
         ``mu_kmax``, ``los``, ``mu_uniform``, ``mu_sigma_kind``, ``mu_taps``
@@ -442,6 +517,7 @@ def count2_soft(*particles: Particles, battrs: BinAttrs, soft_sigma: float=None,
             wattrs=wattrs._to_c(), sattrs=sattrs, spattrs=spattrs,
             soft_sigma=soft_sigma, soft_cutoff=float(soft_cutoff),
             soft_taps=str(soft_taps), soft_accum=str(soft_accum),
+            soft_norm=str(soft_norm),
             soft_mu_sigma=soft_mu_sigma, soft_mu_bins=int(soft_mu_bins),
             soft_mu_edges=soft_mu_edges,
             nthreads=lib_nthreads, return_timings=True)
@@ -456,6 +532,7 @@ def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
                     soft_sigma: float=None, soft_cutoff: float=1e-13,
                     soft_taps: str='exact', soft_accum: str='float32',
                     soft_pad: float=None,
+                    soft_norm: str='gaussian',
                     soft_mu_sigma: float=None,
                     soft_mu_bins: int=0, soft_mu_edges=None,
                     wattrs: WeightAttrs=None, sattrs: SelectionAttrs=None,
@@ -472,7 +549,8 @@ def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
     more kernel.
 
     The kernel is the analytic adjoint of the forward (the same window, the same
-    softmax, differentiated exactly); for the derivation and the conventions --
+    normalisation, differentiated exactly); for the derivation and the
+    conventions --
     window membership and the ``[smin, smax)`` range check held constant -- see
     ``cuda/include/count2_soft.h``. This is the same adjoint pyfcfc exposes as
     ``soft_hist_vjp``.
@@ -483,7 +561,7 @@ def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
         The two catalogs, exactly as passed to :func:`count2_soft` (same
         ``battrs``, ``soft_sigma``, weighting, selections and mesh, or the
         adjoint is of a different function than the forward you ran).
-    battrs, soft_sigma, soft_cutoff, soft_taps, wattrs, sattrs, spattrs, mattrs
+    battrs, soft_sigma, soft_cutoff, soft_taps, soft_norm, wattrs, sattrs, spattrs, mattrs
         As for :func:`count2_soft`; they must reproduce the forward's setup.
     soft_mu_sigma, soft_mu_bins
         As for :func:`count2_soft`. With soft mu binning the mu weights also
@@ -557,6 +635,7 @@ def count2_soft_vjp(*particles: Particles, battrs: BinAttrs, cotangent,
             wattrs=wattrs._to_c(), sattrs=sattrs, spattrs=spattrs,
             soft_sigma=soft_sigma, soft_cutoff=float(soft_cutoff),
             soft_taps=str(soft_taps), soft_accum=str(soft_accum),
+            soft_norm=str(soft_norm),
             soft_mu_sigma=soft_mu_sigma, soft_mu_bins=int(soft_mu_bins),
             soft_mu_edges=soft_mu_edges,
             nthreads=lib_nthreads, return_timings=True)

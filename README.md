@@ -342,11 +342,31 @@ automatically.
 ### 🌫️ Soft binning
 
 `count2` places every pair in exactly one bin. `count2_soft` shares it between
-neighbouring bins with a Gaussian softmax around each bin centre instead: the
-weights of every counted pair sum to one over the real and buffer centres, and
-`soft_sigma -> 0` recovers `count2`.
+neighbouring bins with a Gaussian kernel around each bin centre instead; a kernel
+narrow against the bin recovers `count2` (exactly in the `'softmax'` mode).
+The default `soft_norm='gaussian'` uses the
+discrete-quadrature weights `A_i exp(-x_i)` with
+`A_i = dmu_i / (sqrt(2 pi) sigma_i)`: each pair's weights sum to one up to
+quadrature error (about 0.5% at the default half-bin sigma; kernel mass landing
+outside the counted range is dropped, which `soft_pad` recovers), the kernel is a
+single pass, and no bin competes with its neighbours for a pair's weight, so
+gradients stay well conditioned. `soft_norm='softmax'` restores the old
+behaviour on the separation axis, renormalising each pair's window exactly at
+the cost of a second pass. The `mu` axis of a multipole request is always
+renormalised, whatever `soft_norm` says: `mu = s_parallel / s` lives in
+`[-1, 1]`, a bounded domain where an un-renormalised kernel would lose up to
+half its mass at the poles (and padding is not an option), so `M_0 == 1` and the
+monopole is exactly the isotropic soft count.
+
+**Coming from an earlier release:** the default used to be the softmax
+normalisation, so pass `soft_norm='softmax'` to reproduce older numbers. The two
+differ by about 0.4% in the bulk and by several percent at the outermost bins,
+where the kernel tail leaves the counted range; `CHANGELOG.md` has the details.
+Note also that `soft_sigma` is a *fraction of each bin's width* by default, so on
+a wide log grid an absolute width is not the same kernel at both ends.
+
 It returns the same `Count2` / `Count2Poles` containers, and `attrs` records the soft
-configuration (`soft_sigma`, `soft_cutoff`, `soft_multipoles`, ...).
+configuration (`soft_sigma`, `soft_norm`, `soft_cutoff`, `soft_multipoles`, ...).
 
 ```python
 from cucount.types import count2_soft
@@ -388,11 +408,12 @@ constant width in separation units.
 
 `soft_pad` controls the edge truncation. The kernel spreads each pair with a Gaussian
 of infinite support, but only traverses pairs inside `[s_edges[0], s_edges[-1])`, so the
-outermost bins average a *half* kernel: the last bin comes out biased high (and the
-first low), and the bias grows with the steepness of the correlation function and the
-kernel width. `soft_pad=z` extends the counting range by `z` kernel widths with
+outermost bins average a *truncated* kernel and pick up an edge bias that grows with
+the steepness of the correlation function and the kernel width. Its sign depends on
+the normalisation: the softmax redistributes the missing tail within the window it
+keeps, while the gaussian default simply drops it. `soft_pad=z` extends the counting range by `z` kernel widths with
 **buffer bins** (geometric continuation on a log grid, arithmetic otherwise), lets the
-softmax normalise over the real and buffer centres, and drops the buffer bins from the
+kernel deposit over the real and buffer centres, and drops the buffer bins from the
 result. `None` selects the pyfcfc default `z=2`; `soft_pad=0` restores the previous
 estimator bit for bit. In a periodic box the extended maximum edge is clamped below
 `L/2` (the minimum-image limit), and the lower edge never goes below zero. The buffer
@@ -400,9 +421,10 @@ bins make the traversal enumerate the extra pairs in those shells --- roughly
 `exp(3 z f) - 1` more at the upper edge for log bins --- and `attrs` records the layout
 as `soft_pad`, `soft_pad_lo`, `soft_pad_hi` and `soft_nbins_padded`.
 
-`soft_cutoff` drops the Gaussian tail (the window is renormalized, so weight stays
-conserved) and `soft_taps='fast'` trades ~1e-6 weight accuracy for speed on non-uniform
-grids. For multipoles the mu quadrature is a uniform grid over the full `[-1, 1]` (mu is
+`soft_cutoff` drops the Gaussian tail (`soft_norm='softmax'` renormalizes the remaining
+window, so weight stays conserved; under `'gaussian'` the dropped tail is a small
+quadrature error) and `soft_taps='fast'` trades ~1e-6 weight accuracy for speed on
+non-uniform grids. For multipoles the mu quadrature is a uniform grid over the full `[-1, 1]` (mu is
 not folded, so odd multipoles keep their sign): `soft_mu_bins` sets its resolution and
 `soft_mu_edges` takes caller-supplied cells --- arithmetic ones still take the fast
 recurrence path. The small `soft_sigma -> 0` limit is the honest one for multipoles:
